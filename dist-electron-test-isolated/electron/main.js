@@ -1,0 +1,3959 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.AppState = void 0;
+const electron_1 = require("electron");
+const path_1 = __importDefault(require("path"));
+const fs_1 = __importDefault(require("fs"));
+const electron_updater_1 = require("electron-updater");
+if (!electron_1.app.isPackaged) {
+    require('dotenv').config();
+}
+// Handle stdout/stderr errors at the process level to prevent EIO crashes
+// This is critical for Electron apps that may have their terminal detached
+process.stdout?.on?.('error', () => { });
+process.stderr?.on?.('error', () => { });
+process.on('uncaughtException', (err) => {
+    logToFile('[CRITICAL] Uncaught Exception: ' + redactArgsForLog([err]));
+});
+process.on('unhandledRejection', (reason, promise) => {
+    logToFile('[CRITICAL] Unhandled Rejection: ' + redactArgsForLog([reason]));
+});
+// CQ-04 fix: do NOT call app.getPath() at module load time.
+// app.getPath('documents') is not guaranteed to be available before app.whenReady().
+// Use a lazy getter instead — the path is resolved on first logToFile() call.
+let _logFile = null;
+const getLogFile = () => {
+    if (_logFile)
+        return _logFile;
+    try {
+        _logFile = path_1.default.join(electron_1.app.getPath('documents'), 'natively_debug.log');
+        return _logFile;
+    }
+    catch {
+        // app.ready not yet fired — return null, logToFile will skip silently
+        return null;
+    }
+};
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+// Lazy redactor import — pulled at first call so this file can boot even if
+// the redactor module fails to load (we fall back to a no-op transform).
+let _redactForLog = null;
+function redactArgsForLog(args) {
+    if (!_redactForLog) {
+        try {
+            _redactForLog = require('./utils/redactForLog').redactForLog;
+        }
+        catch {
+            _redactForLog = (xs) => xs.map(a => (a instanceof Error ? a.stack || a.message : (typeof a === 'object' ? JSON.stringify(a) : String(a)))).join(' ');
+        }
+    }
+    return _redactForLog(args);
+}
+/** Maximum log file size before rotation (10 MB). */
+const LOG_MAX_BYTES = 10 * 1024 * 1024;
+function logToFile(msg) {
+    try {
+        const logFile = getLogFile();
+        // If the app isn't ready yet (path not available), skip silently.
+        if (!logFile)
+            return;
+        // P2-1: rotate the log file when it exceeds LOG_MAX_BYTES so that long-running
+        // sessions (or meetings with dense transcripts) don't fill the user's disk.
+        // The previous log is kept as .log.1 for one-generation rollover.
+        try {
+            const stat = fs_1.default.statSync(logFile);
+            if (stat.size >= LOG_MAX_BYTES) {
+                const rotated = logFile + '.1';
+                if (fs_1.default.existsSync(rotated))
+                    fs_1.default.unlinkSync(rotated);
+                fs_1.default.renameSync(logFile, rotated);
+            }
+        }
+        catch {
+            // statSync throws if the file doesn't exist yet — that's fine
+        }
+        fs_1.default.appendFileSync(logFile, new Date().toISOString() + ' ' + msg + '\n');
+    }
+    catch (e) {
+        // Ignore logging errors
+    }
+}
+async function ensureMacMicrophoneAccess(context) {
+    if (process.platform !== 'darwin')
+        return true;
+    try {
+        const currentStatus = electron_1.systemPreferences.getMediaAccessStatus('microphone');
+        console.log(`[Main] macOS microphone permission before ${context}: ${currentStatus}`);
+        if (currentStatus === 'granted') {
+            return true;
+        }
+        const granted = await electron_1.systemPreferences.askForMediaAccess('microphone');
+        console.log(`[Main] macOS microphone permission request during ${context}: ${granted ? 'granted' : 'denied'}`);
+        return granted;
+    }
+    catch (error) {
+        console.error(`[Main] Failed to check macOS microphone permission during ${context}:`, error);
+        return false;
+    }
+}
+/**
+ * Check macOS Screen Recording (kTCCServiceScreenCapture) permission status.
+ *
+ * Electron has no askForMediaAccess('screen') API — macOS only shows the TCC
+ * dialog when the app actually calls a protected API (SCK / CoreAudio tap).
+ * If the permission is 'denied', we cannot re-prompt; the user must re-enable
+ * manually in System Settings → Privacy & Security → Screen Recording.
+ *
+ * Returns false only when the permission is explicitly 'denied'. All other
+ * statuses ('granted', 'not-determined', 'restricted') return true because:
+ *   - 'granted':         already allowed — nothing to do.
+ *   - 'not-determined':  macOS will show the dialog when SCK/CoreAudio tap runs.
+ *   - 'restricted':      managed device policy — nothing we can do programmatically.
+ */
+function getMacScreenCaptureStatus() {
+    if (process.platform !== 'darwin')
+        return 'granted';
+    // In development mode, macOS TCC often falsely reports 'denied' for the electron binary
+    // even if the user has granted permission to their Terminal app.
+    if (!electron_1.app.isPackaged) {
+        console.log('[Main] Ignoring screen capture permission check in development mode');
+        return 'granted';
+    }
+    try {
+        return electron_1.systemPreferences.getMediaAccessStatus('screen');
+    }
+    catch (error) {
+        console.error('[Main] Failed to check screen recording permission:', error);
+        return 'not-determined';
+    }
+}
+function formatPermissionMessage(reason, extra) {
+    const isMac = process.platform === 'darwin';
+    switch (reason) {
+        case 'screen-recording-denied':
+            return isMac
+                ? 'Screen Recording permission denied. Interviewer audio will not be captured. Enable in System Settings → Privacy & Security → Screen Recording, then restart the app.'
+                : 'System audio capture is unavailable. Interviewer audio will not be captured. Check your audio device routing in Settings and restart the meeting.';
+        case 'mac-screen-recording-revoked-rebuild':
+            // Defense-in-depth: even though all call sites must be darwin-gated
+            // (the `mac-` prefix marks this constraint), if a future contributor
+            // calls this from a cross-platform path we degrade gracefully rather
+            // than leak macOS UI strings to Windows users.
+            if (!isMac)
+                return formatPermissionMessage('system-audio-stuck');
+            return 'System audio is being captured but every sample is silent. This usually means macOS Screen Recording permission needs to be re-granted to this build of Natively. Open System Settings → Privacy & Security → Screen Recording, toggle Natively off and back on, then restart the app. (If you recently rebuilt or updated, the previous grant may not apply.)';
+        case 'mic-denied':
+            return isMac
+                ? 'Microphone access denied. Please allow microphone access in System Settings → Privacy & Security → Microphone, then restart Natively.'
+                : 'Microphone access denied. Please allow microphone access in Settings → Privacy → Microphone, then restart Natively.';
+        case 'mic-zero-fill':
+            return isMac
+                ? 'Microphone is producing silent audio. Check that the device is unmuted and that macOS Microphone permission is granted to Natively in System Settings → Privacy & Security → Microphone.'
+                : 'Microphone is producing silent audio. Check that the device is unmuted and that Natively has microphone access in Settings → Privacy → Microphone.';
+        case 'mac-same-device-input-output':
+            // Defense-in-depth: see comment on `mac-screen-recording-revoked-rebuild`.
+            // The CoreAudio Process Tap same-device limitation is macOS-specific;
+            // on Windows WASAPI loopback works fine on the same device as the mic.
+            if (!isMac)
+                return formatPermissionMessage('system-audio-stuck');
+            return `Silent capture detected — input and output are the same device (${extra?.device ?? 'unknown'}). macOS cannot tap a device while it is also the active microphone. Switch input to built-in mic or output to built-in speakers.`;
+        case 'system-audio-stuck':
+            return 'No audio detected on system output for 8s. If your meeting app is using a different output device (Bluetooth headset, virtual cable, second monitor), switch it to your default output, or restart the meeting after switching.';
+    }
+}
+console.log = (...args) => {
+    logToFile('[LOG] ' + redactArgsForLog(args));
+    try {
+        originalLog.apply(console, args);
+    }
+    catch { }
+};
+console.warn = (...args) => {
+    logToFile('[WARN] ' + redactArgsForLog(args));
+    try {
+        originalWarn.apply(console, args);
+    }
+    catch { }
+};
+console.error = (...args) => {
+    logToFile('[ERROR] ' + redactArgsForLog(args));
+    try {
+        originalError.apply(console, args);
+    }
+    catch { }
+};
+const ipcHandlers_1 = require("./ipcHandlers");
+const WindowHelper_1 = require("./WindowHelper");
+const SettingsWindowHelper_1 = require("./SettingsWindowHelper");
+const ModelSelectorWindowHelper_1 = require("./ModelSelectorWindowHelper");
+const CropperWindowHelper_1 = require("./CropperWindowHelper");
+const ScreenshotHelper_1 = require("./ScreenshotHelper");
+const KeybindManager_1 = require("./services/KeybindManager");
+const ProcessingHelper_1 = require("./ProcessingHelper");
+const IntelligenceManager_1 = require("./IntelligenceManager");
+const SystemAudioCapture_1 = require("./audio/SystemAudioCapture");
+const MicrophoneCapture_1 = require("./audio/MicrophoneCapture");
+const AudioDevices_1 = require("./audio/AudioDevices");
+const nativeModuleLoader_1 = require("./audio/nativeModuleLoader");
+const GoogleSTT_1 = require("./audio/GoogleSTT");
+const RestSTT_1 = require("./audio/RestSTT");
+const DeepgramStreamingSTT_1 = require("./audio/DeepgramStreamingSTT");
+const SonioxStreamingSTT_1 = require("./audio/SonioxStreamingSTT");
+const ElevenLabsStreamingSTT_1 = require("./audio/ElevenLabsStreamingSTT");
+const OpenAIStreamingSTT_1 = require("./audio/OpenAIStreamingSTT");
+const NativelyProSTT_1 = require("./audio/NativelyProSTT");
+const ThemeManager_1 = require("./ThemeManager");
+const RAGManager_1 = require("./rag/RAGManager");
+const DatabaseManager_1 = require("./db/DatabaseManager");
+const llm_1 = require("./llm");
+// Premium: Knowledge modules loaded conditionally
+let KnowledgeOrchestratorClass = null;
+let KnowledgeDatabaseManagerClass = null;
+try {
+    KnowledgeOrchestratorClass = require('../premium/electron/knowledge/KnowledgeOrchestrator').KnowledgeOrchestrator;
+    KnowledgeDatabaseManagerClass = require('../premium/electron/knowledge/KnowledgeDatabaseManager').KnowledgeDatabaseManager;
+}
+catch {
+    console.log('[Main] Knowledge modules not available — profile intelligence disabled.');
+}
+const SettingsManager_1 = require("./services/SettingsManager");
+const PhoneMirrorService_1 = require("./services/PhoneMirrorService");
+const verboseLog_1 = require("./verboseLog");
+const ReleaseNotesManager_1 = require("./update/ReleaseNotesManager");
+const OllamaManager_1 = require("./services/OllamaManager");
+class AppState {
+    static instance = null;
+    windowHelper;
+    settingsWindowHelper;
+    modelSelectorWindowHelper;
+    cropperWindowHelper;
+    screenshotHelper;
+    processingHelper;
+    intelligenceManager;
+    themeManager;
+    ragManager = null;
+    knowledgeOrchestrator = null;
+    tray = null;
+    updateAvailable = false;
+    disguiseMode = 'none';
+    // View management
+    view = "queue";
+    isUndetectable = false;
+    problemInfo = null; // Allow null
+    hasDebugged = false;
+    isMeetingActive = false; // Guard for session state leaks
+    // True between Stop click and the end of STT drain. The transcript handler
+    // (and only the transcript handler) treats `isMeetingActive || _isDraining`
+    // as "accept trailing finals" — every other call site looks at
+    // `isMeetingActive` alone, which flips to false synchronously on Stop so the
+    // launcher's "Meeting ongoing" pill switches back to "Start Natively" the
+    // instant the user clicks Stop, with no 250 ms green-→-blue stutter.
+    _isDraining = false;
+    // Tracks remembered output device so reconfigureAudio can no-op when nothing changed.
+    // Mirrors the existing _lastRequestedInputDeviceId for the input side.
+    _lastRequestedOutputDeviceId = undefined;
+    // Promise representing in-flight endMeeting background teardown (STT.stop +
+    // intelligenceManager.stopMeeting + RAG cleanup). startMeeting() awaits this
+    // before booting a new session so the shared STT instances are not torn down
+    // mid-meeting by a stale teardown task.
+    _pendingTeardown = null;
+    _isQuitting = false;
+    _verboseLogging = false;
+    // Tracks whether STT sample-rate has been applied for the current capture
+    // session. Reset on every reconfigureAudio / new pipeline build so the next
+    // first-chunk handler reads the freshly-detected native rate.
+    _sysSttRateApplied = false;
+    _micSttRateApplied = false;
+    _disguiseTimers = []; // Track forceUpdate timeouts
+    _dockDebounceTimer = null; // Debounce dock state changes
+    _dockReassertTimers = []; // Re-assert dock-hidden state after show+focus
+    _ollamaBootstrapPromise = null;
+    screenshotCaptureInProgress = false;
+    // Processing events
+    PROCESSING_EVENTS = {
+        //global states
+        UNAUTHORIZED: "procesing-unauthorized",
+        NO_SCREENSHOTS: "processing-no-screenshots",
+        //states for generating the initial solution
+        INITIAL_START: "initial-start",
+        PROBLEM_EXTRACTED: "problem-extracted",
+        SOLUTION_SUCCESS: "solution-success",
+        INITIAL_SOLUTION_ERROR: "solution-error",
+        //states for processing the debugging
+        DEBUG_START: "debug-start",
+        DEBUG_SUCCESS: "debug-success",
+        DEBUG_ERROR: "debug-error"
+    };
+    constructor() {
+        // 1. Load boot-critical settings first (used by WindowHelpers)
+        const settingsManager = SettingsManager_1.SettingsManager.getInstance();
+        this.isUndetectable = settingsManager.get('isUndetectable') ?? false;
+        this.disguiseMode = settingsManager.get('disguiseMode') ?? 'none';
+        this._verboseLogging = settingsManager.get('verboseLogging') ?? false;
+        (0, verboseLog_1.setVerboseLoggingFlag)(this._verboseLogging);
+        console.log(`[AppState] Initialized with isUndetectable=${this.isUndetectable}, disguiseMode=${this.disguiseMode}, verboseLogging=${this._verboseLogging}`);
+        // 2. Initialize Helpers with loaded state
+        this.windowHelper = new WindowHelper_1.WindowHelper(this);
+        this.settingsWindowHelper = new SettingsWindowHelper_1.SettingsWindowHelper();
+        this.modelSelectorWindowHelper = new ModelSelectorWindowHelper_1.ModelSelectorWindowHelper();
+        this.cropperWindowHelper = new CropperWindowHelper_1.CropperWindowHelper();
+        // 3. Initialize other helpers
+        this.screenshotHelper = new ScreenshotHelper_1.ScreenshotHelper(this.view);
+        this.processingHelper = new ProcessingHelper_1.ProcessingHelper(this);
+        this.windowHelper.setContentProtection(this.isUndetectable);
+        this.settingsWindowHelper.setContentProtection(this.isUndetectable);
+        this.modelSelectorWindowHelper.setContentProtection(this.isUndetectable);
+        this.cropperWindowHelper.setContentProtection(this.isUndetectable);
+        if (process.platform === 'win32' || process.platform === 'darwin') {
+            this.cropperWindowHelper.preload();
+        }
+        // Warm the local Whisper worker in the background so the first recording
+        // session starts instantly instead of waiting for model load from disk.
+        // Only fires if local-whisper is selected AND a model is already cached.
+        setImmediate(() => {
+            try {
+                const { CredentialsManager } = require('./services/CredentialsManager');
+                if (CredentialsManager.getInstance().getSttProvider() === 'local-whisper') {
+                    const { isModelCached } = require('./audio/whisper/modelManager');
+                    const { modelPreloader } = require('./audio/whisper/modelPreloader');
+                    const { resolveInferenceConfig } = require('./audio/whisper/inferenceConfig');
+                    const modelId = settingsManager.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
+                    const { dtype } = resolveInferenceConfig();
+                    if (isModelCached(modelId, dtype)) {
+                        console.log(`[AppState] Preloading local Whisper model: ${modelId}`);
+                        modelPreloader.preload(modelId);
+                    }
+                }
+            }
+            catch (e) {
+                // Non-fatal — recording still works, just with a cold-start delay
+                console.warn('[AppState] Local Whisper preload skipped:', e);
+            }
+        });
+        // Initialize KeybindManager
+        const keybindManager = KeybindManager_1.KeybindManager.getInstance();
+        keybindManager.setWindowHelper(this.windowHelper);
+        keybindManager.setupIpcHandlers();
+        keybindManager.onUpdate(() => {
+            this.updateTrayMenu();
+        });
+        // Stealth keyboard tap (CGEventTap) IPC. Renderer drives the permission
+        // flow + queries availability/state; the tap itself is toggled by the
+        // global shortcut handler above. Only registered on macOS — on other
+        // platforms these handlers no-op so the renderer can render fallback UI.
+        //
+        // removeHandler-then-handle on each channel is defensive against a
+        // second `app.ready` firing (rare but possible during dev HMR / single-
+        // instance second-launch path) — `ipcMain.handle` throws on duplicate
+        // registration, which would propagate as a renderer IPC rejection and
+        // silently leave isCgEventTapAvailableRef at its safe-false default.
+        const registerStealthHandler = (channel, fn) => {
+            electron_1.ipcMain.removeHandler(channel);
+            electron_1.ipcMain.handle(channel, fn);
+        };
+        if (process.platform === 'darwin') {
+            const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+            const stealth = StealthKeyboardManager.getInstance();
+            registerStealthHandler('stealth-tap:available', () => stealth.isAvailable());
+            registerStealthHandler('stealth-tap:open-settings', () => { stealth.openSettings(); });
+            registerStealthHandler('stealth-tap:stop', () => { stealth.stop(); });
+            registerStealthHandler('stealth-tap:start', () => stealth.start());
+            // IME users (Pinyin, Hangul, Kanji, …) cannot compose under the tap
+            // because CGEventTap fires below TIS. Renderer consults this before
+            // click-to-engage so it can fall back to plain DOM focus when an IME
+            // is in play. See electron/services/ImeDetector.ts for the rationale.
+            registerStealthHandler('stealth-tap:should-auto-engage', () => {
+                const { shouldAutoEngageStealthTap } = require('./services/ImeDetector');
+                return shouldAutoEngageStealthTap();
+            });
+            // Force a fresh IME probe and return the refined value. Renderer calls
+            // this on window focus so users who add a Pinyin/Hangul source mid-
+            // session don't silently break CJK composition the next time the tap
+            // would auto-engage (the cached value from mount-time would be stale).
+            registerStealthHandler('stealth-tap:refresh-ime', () => {
+                const { refreshImeDetection, shouldAutoEngageStealthTap } = require('./services/ImeDetector');
+                refreshImeDetection();
+                return shouldAutoEngageStealthTap();
+            });
+        }
+        else {
+            registerStealthHandler('stealth-tap:available', () => false);
+            registerStealthHandler('stealth-tap:open-settings', () => { });
+            registerStealthHandler('stealth-tap:stop', () => { });
+            registerStealthHandler('stealth-tap:start', () => false);
+            // Non-darwin: returns true so the renderer's stealthAutoEngageOkRef
+            // stays true and the explicit isCgEventTapAvailableRef guard (added in
+            // PR #250) is what actually gates blockInputFocus. Inverted relative
+            // to availability on purpose — see ImeDetector.ts:67.
+            registerStealthHandler('stealth-tap:should-auto-engage', () => true);
+            registerStealthHandler('stealth-tap:refresh-ime', () => true);
+        }
+        keybindManager.onShortcutTriggered(async (actionId) => {
+            console.log(`[Main] Global shortcut triggered: ${actionId}`);
+            try {
+                if (actionId === 'general:toggle-visibility') {
+                    this.toggleMainWindow();
+                }
+                else if (actionId === 'general:toggle-mouse-passthrough') {
+                    // Adapted from public PR #113 — verify premium interaction
+                    this.toggleOverlayMousePassthrough();
+                }
+                else if (actionId === 'general:take-screenshot') {
+                    // Route to renderer via global-shortcut so the renderer handles the
+                    // screenshot through the IPC invoke path (request/response guarantee).
+                    // The old pattern — main takes screenshot → fires screenshot-taken event →
+                    // renderer listener catches it — was unreliable in overlay mode because the
+                    // fire-and-forget event could be missed if the listener registration had any
+                    // timing gap. The invoke path used by generalHandlers.takeScreenshot() is
+                    // already proven to work for UI-button screenshots; reuse it here.
+                    const mainWindow = this.getMainWindow();
+                    if (mainWindow && !mainWindow.isDestroyed()) {
+                        mainWindow.webContents.send('global-shortcut', { action: 'takeScreenshot' });
+                    }
+                }
+                else if (actionId === 'general:selective-screenshot') {
+                    const mainWindow = this.getMainWindow();
+                    if (mainWindow && !mainWindow.isDestroyed()) {
+                        mainWindow.webContents.send('global-shortcut', { action: 'selectiveScreenshot' });
+                    }
+                }
+                else if (actionId === 'general:capture-and-process') {
+                    // Single-trigger: capture current screen then immediately request AI analysis
+                    const screenshotPath = await this.takeScreenshot(false);
+                    const preview = await this.getImagePreview(screenshotPath);
+                    // Ensure the window is visible so the user can see the response without stealing focus
+                    this.showMainWindow(true);
+                    // win.focus() can cause macOS to re-activate the app. Re-hide the dock
+                    // if we are in undetectable mode.
+                    if (process.platform === 'darwin' && this.isUndetectable) {
+                        electron_1.app.dock.hide();
+                    }
+                    const mainWindow = this.getMainWindow();
+                    if (mainWindow) {
+                        mainWindow.webContents.send("capture-and-process", {
+                            path: screenshotPath,
+                            preview
+                        });
+                    }
+                    // --- STEALTH SHORTCUTS: no focus, no show, pure IPC dispatch ---
+                    // Chat actions — fire into the renderer without focusing the window
+                }
+                else if (actionId === 'chat:focusInput') {
+                    // Toggle CGEventTap-backed stealth typing mode. While engaged, every
+                    // keystroke is captured at the OS event-pipeline layer and routed to
+                    // the renderer; the foreground app (Zoom/browser/etc.) does NOT
+                    // receive any key events and never loses key/frontmost status. This
+                    // is the only path that delivers true Cluely-grade undetectability
+                    // on macOS — NSPanel-nonactivating gets us 90% there, the tap closes
+                    // the remaining gap (the panel never even has to become key-window).
+                    //
+                    // Falls back to plain panel.focus() if the native tap is unavailable
+                    // (no rebuild yet, no Accessibility permission, or non-macOS).
+                    this.showMainWindow(true);
+                    const overlay = this.windowHelper.getOverlayWindow();
+                    if (overlay && !overlay.isDestroyed()) {
+                        overlay.webContents.send('ensure-expanded');
+                    }
+                    if (process.platform === 'darwin') {
+                        const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+                        const mgr = StealthKeyboardManager.getInstance();
+                        if (mgr.isAvailable()) {
+                            mgr.toggle();
+                            return; // tap is the input path; no need to focus the panel
+                        }
+                    }
+                    // Fallback: panel-safe focus on macOS without tap, brief focus on Win.
+                    if (overlay && !overlay.isDestroyed()) {
+                        overlay.webContents.send('global-shortcut', { action: 'focusInput' });
+                        overlay.focus();
+                    }
+                }
+                else if (actionId === 'chat:whatToAnswer' ||
+                    actionId === 'chat:clarify' ||
+                    actionId === 'chat:followUp' ||
+                    actionId === 'chat:answer' ||
+                    actionId === 'chat:codeHint' ||
+                    actionId === 'chat:brainstorm' ||
+                    actionId === 'chat:dynamicAction4' ||
+                    actionId === 'chat:scrollUp' ||
+                    actionId === 'chat:scrollDown' ||
+                    actionId === 'chat:scrollLeft' ||
+                    actionId === 'chat:scrollRight') {
+                    const actionMap = {
+                        'chat:whatToAnswer': 'whatToAnswer',
+                        'chat:clarify': 'clarify',
+                        'chat:followUp': 'followUp',
+                        'chat:answer': 'answer',
+                        'chat:codeHint': 'codeHint',
+                        'chat:brainstorm': 'brainstorm',
+                        'chat:dynamicAction4': 'dynamicAction4',
+                        'chat:scrollUp': 'scrollUp',
+                        'chat:scrollDown': 'scrollDown',
+                        'chat:scrollLeft': 'scrollLeft',
+                        'chat:scrollRight': 'scrollRight',
+                    };
+                    const action = actionMap[actionId];
+                    // Send to all windows without focusing — stealth operation
+                    const allWindows = electron_1.BrowserWindow.getAllWindows();
+                    allWindows.forEach(win => {
+                        if (!win.isDestroyed()) {
+                            win.webContents.send('global-shortcut', { action });
+                        }
+                    });
+                    // Window movement — move window position without focus change
+                }
+                else if (actionId === 'window:move-up') {
+                    this.windowHelper.moveWindowUp();
+                }
+                else if (actionId === 'window:move-down') {
+                    this.windowHelper.moveWindowDown();
+                }
+                else if (actionId === 'window:move-left') {
+                    this.windowHelper.moveWindowLeft();
+                }
+                else if (actionId === 'window:move-right') {
+                    this.windowHelper.moveWindowRight();
+                    // General actions that are now global (stealth)
+                }
+                else if (actionId === 'general:process-screenshots') {
+                    const allWindows = electron_1.BrowserWindow.getAllWindows();
+                    allWindows.forEach(win => {
+                        if (!win.isDestroyed()) {
+                            win.webContents.send('global-shortcut', { action: 'processScreenshots' });
+                        }
+                    });
+                }
+                else if (actionId === 'general:reset-cancel') {
+                    const allWindows = electron_1.BrowserWindow.getAllWindows();
+                    allWindows.forEach(win => {
+                        if (!win.isDestroyed()) {
+                            win.webContents.send('global-shortcut', { action: 'resetCancel' });
+                        }
+                    });
+                }
+            }
+            catch (e) {
+                if (e.message !== "Selection cancelled" && e.message !== "Screenshot capture already in progress") {
+                    console.error(`[Main] Error handling global shortcut ${actionId}:`, e);
+                }
+            }
+        });
+        // Inject WindowHelper into other helpers
+        this.settingsWindowHelper.setWindowHelper(this.windowHelper);
+        this.modelSelectorWindowHelper.setWindowHelper(this.windowHelper);
+        // Initialize IntelligenceManager with LLMHelper
+        this.intelligenceManager = new IntelligenceManager_1.IntelligenceManager(this.processingHelper.getLLMHelper());
+        // Initialize ThemeManager
+        this.themeManager = ThemeManager_1.ThemeManager.getInstance();
+        // Restore toggle states that live in LLMHelper memory.
+        // This MUST happen here — not inside initializeRAGManager() — so that
+        // it runs unconditionally regardless of whether premium modules are available.
+        // Previously, groqFastTextMode restore was inside the KnowledgeOrchestrator
+        // block which silently skips when premium modules are absent.
+        {
+            const llmHelper = this.processingHelper.getLLMHelper();
+            if (settingsManager.get('groqFastTextMode')) {
+                llmHelper.setGroqFastTextMode(true);
+                console.log('[AppState] Fast mode restored from settings');
+            }
+            llmHelper.setCodexCliConfig({
+                enabled: !!settingsManager.get('codexCliEnabled'),
+                path: settingsManager.get('codexCliPath') || 'codex',
+                model: settingsManager.get('codexCliModel') || 'gpt-5.4',
+                fastModel: settingsManager.get('codexCliFastModel') || 'gpt-5.3-codex-spark',
+                timeoutMs: settingsManager.get('codexCliTimeoutMs') || 60_000,
+                sandboxMode: settingsManager.get('codexCliSandboxMode') || 'read-only',
+            });
+            // Restore custom notes for non-premium path
+            try {
+                const savedNotes = DatabaseManager_1.DatabaseManager.getInstance().getCustomNotes();
+                if (savedNotes) {
+                    llmHelper.setCustomNotes(savedNotes);
+                }
+            }
+            catch (_) { }
+        }
+        // Initialize RAGManager (requires database to be ready)
+        this.initializeRAGManager();
+        // Check and prep Ollama embedding model
+        this.bootstrapOllamaEmbeddings();
+        this.setupIntelligenceEvents();
+        // Pre-warm the zero-shot intent classifier in background
+        (0, llm_1.warmupIntentClassifier)();
+        // Setup Ollama IPC
+        this.setupOllamaIpcHandlers();
+        // --- NEW SYSTEM AUDIO PIPELINE (SOX + NODE GOOGLE STT) ---
+        // LAZY INIT: Do not setup pipeline here to prevent launch volume surge.
+        // this.setupSystemAudioPipeline()
+        // Initialize Auto-Updater
+        this.setupAutoUpdater();
+    }
+    broadcast(channel, ...args) {
+        electron_1.BrowserWindow.getAllWindows().forEach(win => {
+            if (!win.isDestroyed()) {
+                win.webContents.send(channel, ...args);
+            }
+        });
+    }
+    getIsMeetingActive() {
+        return this.isMeetingActive;
+    }
+    isQuitting() {
+        return this._isQuitting;
+    }
+    setQuitting(value) {
+        this._isQuitting = value;
+    }
+    broadcastMeetingState() {
+        this.broadcast('meeting-state-changed', { isActive: this.isMeetingActive });
+    }
+    async bootstrapOllamaEmbeddings() {
+        this._ollamaBootstrapPromise = (async () => {
+            try {
+                const { OllamaBootstrap } = require('./rag/OllamaBootstrap');
+                const bootstrap = new OllamaBootstrap();
+                // Fire and forget — don't await this before showing the window
+                const result = await bootstrap.bootstrap('nomic-embed-text', (status, percent) => {
+                    // Send progress to renderer via IPC
+                    this.broadcast('ollama:pull-progress', { status, percent });
+                });
+                if (result === 'pulled' || result === 'already_pulled') {
+                    this.broadcast('ollama:pull-complete');
+                    // Re-resolve the embedding provider given that Ollama might now be available
+                    if (this.ragManager) {
+                        console.log('[AppState] Ollama model ready, re-evaluating RAG pipeline provider');
+                        const { CredentialsManager } = require('./services/CredentialsManager');
+                        const cm = CredentialsManager.getInstance();
+                        this.ragManager.initializeEmbeddings({
+                            openaiKey: cm.getOpenaiApiKey() || process.env.OPENAI_API_KEY || undefined,
+                            geminiKey: cm.getGeminiApiKey() || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || undefined,
+                            ollamaUrl: process.env.OLLAMA_URL || "http://localhost:11434",
+                            providerDataScopes: (() => { try {
+                                const { SettingsManager } = require('./services/SettingsManager');
+                                return SettingsManager.getInstance().get('providerDataScopes');
+                            }
+                            catch {
+                                return undefined;
+                            } })()
+                        });
+                    }
+                }
+            }
+            catch (err) {
+                console.error('[AppState] Failed to bootstrap Ollama:', err);
+            }
+        })();
+    }
+    initializeRAGManager() {
+        try {
+            const db = DatabaseManager_1.DatabaseManager.getInstance();
+            const sqliteDb = db.getDb();
+            if (sqliteDb) {
+                const { CredentialsManager } = require('./services/CredentialsManager');
+                const cm = CredentialsManager.getInstance();
+                const openaiKey = cm.getOpenaiApiKey() || process.env.OPENAI_API_KEY;
+                const geminiKey = cm.getGeminiApiKey() || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+                const providerDataScopes = (() => { try {
+                    const { SettingsManager } = require('./services/SettingsManager');
+                    return SettingsManager.getInstance().get('providerDataScopes');
+                }
+                catch {
+                    return undefined;
+                } })();
+                this.ragManager = new RAGManager_1.RAGManager({
+                    db: sqliteDb,
+                    dbPath: db.getDbPath(),
+                    extPath: db.getExtPath(),
+                    openaiKey,
+                    geminiKey,
+                    ollamaUrl: process.env.OLLAMA_URL || 'http://localhost:11434',
+                    providerDataScopes
+                });
+                this.ragManager.setLLMHelper(this.processingHelper.getLLMHelper());
+                console.log('[AppState] RAGManager initialized');
+            }
+        }
+        catch (error) {
+            console.error('[AppState] Failed to initialize RAGManager:', error);
+        }
+        // Initialize Knowledge Orchestrator
+        try {
+            const db = DatabaseManager_1.DatabaseManager.getInstance();
+            const sqliteDb = db.getDb();
+            if (sqliteDb && KnowledgeDatabaseManagerClass && KnowledgeOrchestratorClass) {
+                const knowledgeDb = new KnowledgeDatabaseManagerClass(sqliteDb);
+                this.knowledgeOrchestrator = new KnowledgeOrchestratorClass(knowledgeDb);
+                // Wire up LLM functions
+                const llmHelper = this.processingHelper.getLLMHelper();
+                // generateContent function for LLM calls
+                this.knowledgeOrchestrator.setGenerateContentFn(async (contents) => {
+                    return await llmHelper.generateContentStructured(contents[0]?.text || '');
+                });
+                // Embedding function — lazily delegate to the cascaded EmbeddingPipeline
+                // (OpenAI → Gemini → Ollama → Local bundled model).
+                // We await waitForReady() so uploads during boot wait for the pipeline
+                // instead of immediately throwing 'not ready'.
+                const self = this;
+                this.knowledgeOrchestrator.setEmbedFn(async (text) => {
+                    const pipeline = self.ragManager?.getEmbeddingPipeline();
+                    if (!pipeline)
+                        throw new Error('RAG pipeline not available');
+                    await pipeline.waitForReady();
+                    return await pipeline.getEmbedding(text);
+                });
+                if (typeof this.knowledgeOrchestrator.setEmbedQueryFn === 'function') {
+                    this.knowledgeOrchestrator.setEmbedQueryFn(async (text) => {
+                        const pipeline = self.ragManager?.getEmbeddingPipeline();
+                        if (!pipeline)
+                            throw new Error('RAG pipeline not available');
+                        await pipeline.waitForReady();
+                        return await pipeline.getEmbeddingForQuery(text);
+                    });
+                }
+                // Attach KnowledgeOrchestrator to LLMHelper
+                llmHelper.setKnowledgeOrchestrator(this.knowledgeOrchestrator);
+                // Restore persisted toggle states so UI reflects what the user left them as.
+                // NOTE: groqFastTextMode is now restored unconditionally in the AppState constructor
+                // so it is not repeated here.
+                const sm = SettingsManager_1.SettingsManager.getInstance();
+                if (sm.get('knowledgeMode')) {
+                    this.knowledgeOrchestrator.setKnowledgeMode(true);
+                    console.log('[AppState] Knowledge mode restored from settings');
+                }
+                // Restore custom notes so orchestrator has them from first request
+                const savedNotes = DatabaseManager_1.DatabaseManager.getInstance().getCustomNotes();
+                if (savedNotes) {
+                    this.knowledgeOrchestrator.setCustomNotes(savedNotes);
+                    llmHelper.setCustomNotes(savedNotes);
+                    console.log('[AppState] Custom notes restored');
+                }
+                console.log('[AppState] KnowledgeOrchestrator initialized');
+            }
+        }
+        catch (error) {
+            console.error('[AppState] Failed to initialize KnowledgeOrchestrator:', error);
+        }
+    }
+    setupAutoUpdater() {
+        electron_updater_1.autoUpdater.autoDownload = false;
+        electron_updater_1.autoUpdater.autoInstallOnAppQuit = false; // Manual install only via button
+        // Default to latest (stable) channel - matches latest.yml generated by electron-builder
+        electron_updater_1.autoUpdater.channel = 'latest';
+        console.log(`[AutoUpdater] Channel: ${electron_updater_1.autoUpdater.channel}`);
+        electron_updater_1.autoUpdater.on("checking-for-update", () => {
+            console.log("[AutoUpdater] Checking for update...");
+            this.broadcast("update-checking");
+        });
+        electron_updater_1.autoUpdater.on("update-available", async (info) => {
+            console.log("[AutoUpdater] Update available:", info.version);
+            this.updateAvailable = true;
+            // Fetch structured release notes
+            const releaseManager = ReleaseNotesManager_1.ReleaseNotesManager.getInstance();
+            const notes = await releaseManager.fetchReleaseNotes(info.version);
+            // Notify renderer that an update is available with parsed notes if available
+            this.broadcast("update-available", {
+                ...info,
+                parsedNotes: notes
+            });
+        });
+        electron_updater_1.autoUpdater.on("update-not-available", (info) => {
+            console.log("[AutoUpdater] Update not available:", info.version);
+            this.broadcast("update-not-available", info);
+        });
+        electron_updater_1.autoUpdater.on("error", (err) => {
+            console.error("[AutoUpdater] Error:", err);
+            // Include more details in the error message for debugging
+            const errorMessage = err.message || err.toString() || 'Unknown update error';
+            this.broadcast("update-error", errorMessage);
+        });
+        electron_updater_1.autoUpdater.on("download-progress", (progressObj) => {
+            let log_message = "Download speed: " + progressObj.bytesPerSecond;
+            log_message = log_message + " - Downloaded " + progressObj.percent + "%";
+            log_message = log_message + " (" + progressObj.transferred + "/" + progressObj.total + ")";
+            console.log("[AutoUpdater] " + log_message);
+            this.broadcast("download-progress", progressObj);
+        });
+        electron_updater_1.autoUpdater.on("update-downloaded", (info) => {
+            console.log("[AutoUpdater] Update downloaded:", info.version);
+            // Notify renderer that update is ready to install
+            this.broadcast("update-downloaded", info);
+        });
+        // Start checking for updates with a 10-second delay
+        setTimeout(() => {
+            if (process.env.NODE_ENV === "development") {
+                console.log("[AutoUpdater] Development mode: Skipping auto check (use manual button)");
+            }
+            else {
+                electron_updater_1.autoUpdater.checkForUpdatesAndNotify().catch(err => {
+                    console.error("[AutoUpdater] Failed to check for updates:", err);
+                });
+            }
+        }, 10000);
+    }
+    async checkForUpdatesManual() {
+        try {
+            console.log('[AutoUpdater] Checking for updates manually via GitHub API...');
+            const releaseManager = ReleaseNotesManager_1.ReleaseNotesManager.getInstance();
+            // Fetch latest release
+            const notes = await releaseManager.fetchReleaseNotes('latest');
+            if (notes) {
+                const currentVersion = electron_1.app.getVersion();
+                const latestVersionTag = notes.version; // e.g., "v1.2.0" or "1.2.0"
+                const latestVersion = latestVersionTag.replace(/^v/, '');
+                console.log(`[AutoUpdater] Manual Check: Current=${currentVersion}, Latest=${latestVersion}`);
+                if (this.isVersionNewer(currentVersion, latestVersion)) {
+                    console.log('[AutoUpdater] Manual Check: New version found!');
+                    this.updateAvailable = true;
+                    // Mock an info object compatible with electron-updater
+                    const info = {
+                        version: latestVersion,
+                        files: [],
+                        path: '',
+                        sha512: '',
+                        releaseName: notes.summary,
+                        releaseNotes: notes.fullBody
+                    };
+                    // Notify renderer
+                    this.broadcast("update-available", {
+                        ...info,
+                        parsedNotes: notes
+                    });
+                }
+                else {
+                    console.log('[AutoUpdater] Manual Check: App is up to date.');
+                    this.broadcast("update-not-available", { version: currentVersion });
+                }
+            }
+        }
+        catch (err) {
+            console.error('[AutoUpdater] Manual update check failed:', err);
+        }
+    }
+    isVersionNewer(current, latest) {
+        // EC-01 fix: strip pre-release suffixes (e.g. "2.1.0-beta.1" → "2.1.0")
+        // before splitting so Number() never returns NaN on comparison.
+        const stripPre = (v) => v.replace(/-.*$/, '');
+        const c = stripPre(current).split('.').map(Number);
+        const l = stripPre(latest).split('.').map(Number);
+        for (let i = 0; i < 3; i++) {
+            const cv = c[i] || 0;
+            const lv = l[i] || 0;
+            if (lv > cv)
+                return true;
+            if (lv < cv)
+                return false;
+        }
+        return false;
+    }
+    async quitAndInstallUpdate() {
+        console.log('[AutoUpdater] quitAndInstall called - applying update...');
+        // On macOS, unsigned apps can't auto-restart via quitAndInstall
+        // Workaround: Open the folder containing the downloaded update so user can install manually
+        if (process.platform === 'darwin') {
+            try {
+                // Get the downloaded update file path (e.g., .../Natively-1.0.9-mac.zip)
+                const updateFile = electron_updater_1.autoUpdater.downloadedUpdateHelper?.file;
+                console.log('[AutoUpdater] Downloaded update file:', updateFile);
+                if (updateFile) {
+                    const updateDir = path_1.default.dirname(updateFile);
+                    // Open the directory containing the update in Finder
+                    await electron_1.shell.openPath(updateDir);
+                    console.log('[AutoUpdater] Opened update directory:', updateDir);
+                    // Quit the app so user can install new version
+                    setTimeout(() => electron_1.app.quit(), 1000);
+                    return;
+                }
+            }
+            catch (err) {
+                console.error('[AutoUpdater] Failed to open update directory:', err);
+            }
+        }
+        // Fallback to standard quitAndInstall (works on Windows/Linux or if signed)
+        setImmediate(() => {
+            try {
+                electron_updater_1.autoUpdater.quitAndInstall(false, true);
+            }
+            catch (err) {
+                console.error('[AutoUpdater] quitAndInstall failed:', err);
+                electron_1.app.exit(0);
+            }
+        });
+    }
+    async checkForUpdates() {
+        console.log('[AutoUpdater] Manual check for updates requested');
+        try {
+            // In development mode, use manual GitHub API check (electron-updater skips in dev)
+            if (process.env.NODE_ENV === "development") {
+                await this.checkForUpdatesManual();
+            }
+            else {
+                await electron_updater_1.autoUpdater.checkForUpdatesAndNotify();
+            }
+        }
+        catch (err) {
+            console.error('[AutoUpdater] checkForUpdates failed:', err);
+            const errorMessage = err.message || err.toString() || 'Update check failed';
+            this.broadcast("update-error", errorMessage);
+        }
+    }
+    downloadUpdate() {
+        console.log('[AutoUpdater] Starting download...');
+        try {
+            // Errors during download are surfaced via autoUpdater.on("error") which
+            // already broadcasts "update-error". Do not broadcast here to avoid duplicates.
+            electron_updater_1.autoUpdater.downloadUpdate().catch(err => {
+                console.error('[AutoUpdater] downloadUpdate failed:', err);
+            });
+        }
+        catch (err) {
+            console.error('[AutoUpdater] downloadUpdate exception:', err);
+        }
+    }
+    // New Property for System Audio & Microphone
+    systemAudioCapture = null;
+    microphoneCapture = null;
+    audioTestCapture = null; // For audio settings test
+    _audioTestStarting = false; // P2-12: in-flight guard against concurrent calls
+    googleSTT = null; // Interviewer
+    googleSTT_User = null; // User
+    createSTTProvider(speaker) {
+        const { CredentialsManager } = require('./services/CredentialsManager');
+        const sttProvider = CredentialsManager.getInstance().getSttProvider();
+        const sttLanguage = CredentialsManager.getInstance().getSttLanguage();
+        // 'none' means the user has explicitly disabled STT (no provider selected).
+        // Return null so the pipeline skips STT without falling back to Google.
+        if (sttProvider === 'none') {
+            console.log(`[Main] STT provider is 'none' — audio capture will proceed but transcription is disabled.`);
+            return null;
+        }
+        let stt;
+        if (sttProvider === 'natively') {
+            const nativelyKey = CredentialsManager.getInstance().getNativelyApiKey();
+            if (!nativelyKey) {
+                // Natively is Coming Soon — no key means degrade gracefully like every other provider
+                console.warn(`[Main] No Natively API Key configured for ${speaker}, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+            else {
+                // 'system' for interviewer (system audio), 'mic' for user (microphone).
+                // The server uses ${key}:${channel} as the session key so both streams
+                // can coexist without triggering concurrent_session_blocked.
+                stt = new NativelyProSTT_1.NativelyProSTT(nativelyKey, speaker === 'interviewer' ? 'system' : 'mic');
+            }
+        }
+        else if (sttProvider === 'deepgram') {
+            const apiKey = CredentialsManager.getInstance().getDeepgramApiKey();
+            if (apiKey) {
+                console.log(`[Main] Using DeepgramStreamingSTT for ${speaker}`);
+                stt = new DeepgramStreamingSTT_1.DeepgramStreamingSTT(apiKey);
+            }
+            else {
+                console.warn(`[Main] No API key for Deepgram STT, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+        }
+        else if (sttProvider === 'soniox') {
+            const apiKey = CredentialsManager.getInstance().getSonioxApiKey();
+            if (apiKey) {
+                console.log(`[Main] Using SonioxStreamingSTT for ${speaker}`);
+                stt = new SonioxStreamingSTT_1.SonioxStreamingSTT(apiKey);
+            }
+            else {
+                console.warn(`[Main] No API key for Soniox STT, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+        }
+        else if (sttProvider === 'elevenlabs') {
+            const apiKey = CredentialsManager.getInstance().getElevenLabsApiKey();
+            if (apiKey) {
+                console.log(`[Main] Using ElevenLabsStreamingSTT for ${speaker}`);
+                stt = new ElevenLabsStreamingSTT_1.ElevenLabsStreamingSTT(apiKey);
+            }
+            else {
+                console.warn(`[Main] No API key for ElevenLabs STT, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+        }
+        else if (sttProvider === 'openai') {
+            // OpenAI: WebSocket Realtime (gpt-4o-transcribe → gpt-4o-mini-transcribe) with whisper-1 REST fallback.
+            // If a custom OpenAI-compatible base URL is configured (e.g. Speaches), the STT class
+            // skips the Realtime WS path and uses REST against the custom endpoint.
+            const apiKey = CredentialsManager.getInstance().getOpenAiSttApiKey();
+            const baseUrl = CredentialsManager.getInstance().getOpenAiSttBaseUrl();
+            if (apiKey) {
+                console.log(`[Main] Using OpenAIStreamingSTT for ${speaker}${baseUrl ? ` (custom endpoint: ${baseUrl})` : ' (WebSocket+REST fallback)'}`);
+                stt = new OpenAIStreamingSTT_1.OpenAIStreamingSTT(apiKey, baseUrl);
+            }
+            else {
+                console.warn(`[Main] No API key for OpenAI STT, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+        }
+        else if (sttProvider === 'groq' || sttProvider === 'azure' || sttProvider === 'ibmwatson') {
+            let apiKey;
+            let region;
+            let modelOverride;
+            if (sttProvider === 'groq') {
+                apiKey = CredentialsManager.getInstance().getGroqSttApiKey();
+                modelOverride = CredentialsManager.getInstance().getGroqSttModel();
+            }
+            else if (sttProvider === 'azure') {
+                apiKey = CredentialsManager.getInstance().getAzureApiKey();
+                region = CredentialsManager.getInstance().getAzureRegion();
+            }
+            else if (sttProvider === 'ibmwatson') {
+                apiKey = CredentialsManager.getInstance().getIbmWatsonApiKey();
+                region = CredentialsManager.getInstance().getIbmWatsonRegion();
+            }
+            if (apiKey) {
+                console.log(`[Main] Using RestSTT (${sttProvider}) for ${speaker}`);
+                stt = new RestSTT_1.RestSTT(sttProvider, apiKey, modelOverride, region);
+            }
+            else {
+                console.warn(`[Main] No API key for ${sttProvider} STT, falling back to GoogleSTT`);
+                stt = new GoogleSTT_1.GoogleSTT(speaker);
+            }
+        }
+        else if (sttProvider === 'local-whisper') {
+            const { LocalWhisperSTT } = require('./audio/LocalWhisperSTT');
+            const sm = SettingsManager_1.SettingsManager.getInstance();
+            const globalModel = sm.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
+            // Per-channel override: when enabled the two STT instances may load
+            // different models (e.g. Moonshine Tiny for mic, Moonshine Base for
+            // system audio). Falls back to globalModel if the per-channel slot is
+            // empty or the feature is disabled.
+            let modelId = globalModel;
+            if (sm.get('localWhisperPerChannelEnabled')) {
+                const override = speaker === 'interviewer'
+                    ? sm.get('localWhisperModelSystem')
+                    : sm.get('localWhisperModelMic');
+                if (override)
+                    modelId = override;
+            }
+            console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId}`);
+            const lws = new LocalWhisperSTT(modelId);
+            // Channel label disambiguates the two concurrent instances in latency logs.
+            lws.setChannel(speaker === 'interviewer' ? 'system' : 'mic');
+            stt = lws;
+        }
+        else {
+            stt = new GoogleSTT_1.GoogleSTT(speaker);
+        }
+        stt.setRecognitionLanguage(sttLanguage);
+        // Wire Transcript Events
+        stt.on('transcript', (segment) => {
+            // Accept transcripts while a meeting is active OR while we're draining
+            // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
+            // window between Stop click and STT socket close so the user's last
+            // sentence isn't silently dropped.
+            if (!this.isMeetingActive && !this._isDraining) {
+                return;
+            }
+            this.intelligenceManager.handleTranscript({
+                speaker: speaker,
+                text: segment.text,
+                timestamp: Date.now(),
+                final: segment.isFinal,
+                confidence: segment.confidence
+            });
+            // Feed final transcript to JIT RAG indexer
+            if (segment.isFinal && this.ragManager) {
+                this.ragManager.feedLiveTranscript([{
+                        speaker: speaker,
+                        text: segment.text,
+                        timestamp: Date.now()
+                    }]);
+            }
+            const helper = this.getWindowHelper();
+            const payload = {
+                speaker: speaker,
+                text: segment.text,
+                timestamp: Date.now(),
+                final: segment.isFinal,
+                confidence: segment.confidence
+            };
+            helper.getLauncherWindow()?.webContents.send('native-audio-transcript', payload);
+            helper.getOverlayWindow()?.webContents.send('native-audio-transcript', payload);
+            // Feed final recruiter (system audio) transcripts to negotiation tracker
+            if (segment.isFinal && speaker === 'interviewer') {
+                this.knowledgeOrchestrator?.feedInterviewerUtterance?.(segment.text);
+            }
+        });
+        // Consecutive failure counter — reset on any successful final transcript
+        let _consecutiveErrors = 0;
+        // Track state so we broadcast 'connected' on recovery from failed/reconnecting
+        let _lastState = 'reconnecting';
+        stt.on('error', (err) => {
+            // Google streamingRecognize's 10s silence timeout closes the stream
+            // with gRPC code 11 ("Audio Timeout Error"). GoogleSTT already
+            // swallows this case before it reaches us, but other providers may
+            // surface a similar idle-timeout that the lazy-reconnect path
+            // recovers from cleanly. Downgrade to a one-liner here as well so
+            // a stray bubble-up doesn't cascade into stack-trace noise.
+            const grpcCode = err?.code;
+            if (grpcCode === 11 || /Audio Timeout Error/i.test(err.message || '')) {
+                console.warn(`[Main] STT (${speaker}) idle-timed-out (provider's no-audio limit), reconnecting on next chunk.`);
+                return;
+            }
+            console.error(`[Main] STT (${speaker}) Error:`, err);
+            // Extract richer error info from Axios errors (RestSTT)
+            let errorMessage = err.message;
+            const axiosErr = err;
+            const httpStatus = axiosErr?.response?.status || 0;
+            if (axiosErr?.response?.data?.error) {
+                const respErr = axiosErr.response.data.error;
+                const respMsg = typeof respErr === 'string' ? respErr : (respErr.message || respErr.code || JSON.stringify(respErr));
+                errorMessage = httpStatus ? `${httpStatus} ${respMsg}` : respMsg;
+            }
+            else if (httpStatus) {
+                errorMessage = `${httpStatus} ${axiosErr.response.statusText}`;
+            }
+            // Immediately fatal: auth/account problems — no amount of retrying helps
+            const isAuthError = httpStatus === 401
+                || err.message.toLowerCase().includes('auth_timeout')
+                || err.message.toLowerCase().includes('invalid_key')
+                || err.message.toLowerCase().includes('invalid api')
+                || err.message.toLowerCase().includes('authentication');
+            const isQuotaError = err.message.toLowerCase().includes('transcription_quota_exceeded')
+                || err.message.toLowerCase().includes('quota');
+            if (isAuthError) {
+                _consecutiveErrors = 0;
+                _lastState = 'failed';
+                this.broadcast('stt-status', {
+                    state: 'failed',
+                    provider: sttProvider,
+                    error: errorMessage,
+                    channel: speaker,
+                });
+                return;
+            }
+            // Retryable: network drop, timeout, 5xx, 400, 429, WS drop
+            _consecutiveErrors++;
+            const maxErrors = 5;
+            if (_consecutiveErrors >= maxErrors || isQuotaError) {
+                _lastState = 'failed';
+                this.broadcast('stt-status', {
+                    state: 'failed',
+                    provider: sttProvider,
+                    error: isQuotaError
+                        ? errorMessage
+                        : `STT provider failed (${_consecutiveErrors} consecutive errors): ${errorMessage}`,
+                    channel: speaker,
+                    reconnectAttempts: _consecutiveErrors,
+                });
+            }
+            else {
+                _lastState = 'reconnecting';
+                this.broadcast('stt-status', {
+                    state: 'reconnecting',
+                    provider: sttProvider,
+                    error: errorMessage,
+                    channel: speaker,
+                    reconnectAttempts: _consecutiveErrors,
+                });
+            }
+        });
+        // Track successful transcripts — resets consecutive error counter
+        // Broadcasts 'connected' whenever we recover from reconnecting/failed
+        stt.on('transcript', (segment) => {
+            if (segment.isFinal) {
+                _consecutiveErrors = 0; // Success — reset counter
+                if (_lastState !== 'connected') {
+                    _lastState = 'connected';
+                    this.broadcast('stt-status', {
+                        state: 'connected',
+                        provider: sttProvider,
+                        channel: speaker,
+                    });
+                }
+            }
+        });
+        // Non-fatal telemetry from providers (e.g. OpenAIStreamingSTT emits this
+        // when the pre-session ring buffer evicts leading audio while waiting for
+        // the WebSocket handshake). Surface it in the main-process log so the
+        // signal isn't silently dropped — the event is informational, not a status
+        // change, so we don't push it through the stt-status channel.
+        stt.on('warning', (w) => {
+            console.warn(`[Main] STT (${speaker}) warning: ${w?.code ?? 'unknown'}`, { provider: sttProvider, message: w?.message, droppedBytes: w?.droppedBytes });
+        });
+        // Auto language detection: NativelyProSTT emits 'languageDetected' when the
+        // backend resolves the language from the first audio batch. Notify the renderer
+        // so the settings UI can show what was detected.
+        if (stt instanceof NativelyProSTT_1.NativelyProSTT) {
+            stt.on('languageDetected', (bcp47) => {
+                console.log(`[Main] STT language auto-detected (${speaker}): ${bcp47}`);
+                const helper = this.getWindowHelper();
+                helper.getMainWindow()?.webContents.send('stt-language-auto-detected', bcp47);
+                helper.getLauncherWindow()?.webContents.send('stt-language-auto-detected', bcp47);
+            });
+            // Persistent-reconnect signal: NativelyProSTT now retries indefinitely
+            // with a 30s backoff cap, but we want the user to know after ~5 attempts
+            // (~30–90s of dead transcript) that the issue is sustained, not a blip.
+            // Reuse the stt-status channel with state='reconnecting' and a higher
+            // attempts count so the renderer's existing banner picks it up.
+            stt.on('persistent-reconnect', (info) => {
+                console.warn(`[Main] STT persistent reconnect (${speaker}): ${info.attempts} consecutive attempts.`);
+                this.broadcast('stt-status', {
+                    state: 'reconnecting',
+                    provider: sttProvider,
+                    error: `Reconnecting to transcription service — ${info.attempts} consecutive attempts. Check your network connection.`,
+                    channel: speaker,
+                    reconnectAttempts: info.attempts,
+                });
+            });
+        }
+        return stt;
+    }
+    /**
+     * REFACTOR: wireSystemCapture / wireMicCapture.
+     *
+     * Previously the listener-wiring blocks for SystemAudioCapture were
+     * duplicated three times (setupSystemAudioPipeline + happy-path of
+     * reconfigureAudio + fallback-path of reconfigureAudio), each with its own
+     * closure-local chunk counter (`_sysChunkCount` / `_rcfgSysChunkCount` /
+     * `_dfltSysChunkCount`) and slightly different log prefix. That made it
+     * impossible to know which counter was active from the logs.
+     *
+     * Consolidation: a single helper attaches all four listeners against the
+     * given capture instance. The `label` parameter only affects logging so
+     * the originating call site is still identifiable. setupAudioRecoveryHandler
+     * is also called here so every wire-up path gets recovery for free.
+     */
+    wireSystemCapture(capture, label = '') {
+        const prefix = label ? `[Main] ${label} ` : '[Main] ';
+        let chunkCount = 0;
+        // Watchdog: if no chunks arrive within 8s of capture start, the most likely
+        // causes are (a) Screen Recording permission was revoked between the TCC
+        // check and SCK init, (b) the meeting app routes audio to a device the
+        // CoreAudio Tap isn't bound to, or (c) the system is genuinely silent.
+        // Production-grade apps surface this so the user knows their interviewer's
+        // audio isn't being picked up — instead of staring at an empty transcript.
+        let stuckTimer = null;
+        const armStuckWatchdog = () => {
+            if (stuckTimer)
+                clearTimeout(stuckTimer);
+            stuckTimer = setTimeout(() => {
+                if (this.systemAudioCapture !== capture)
+                    return; // capture was replaced
+                if (chunkCount > 0)
+                    return; // already producing
+                if (!this.isMeetingActive)
+                    return; // meeting ended
+                // Bluetooth devices like AirPods register with separate identifiers
+                // for input (cpal device name) and output (CoreAudio UID with
+                // optional :input/:output suffix). When the user has the same
+                // physical device on both sides of the pipeline, macOS cannot run a
+                // CoreAudio Process Tap on it while it's also the active microphone
+                // — the tap initializes "successfully" but every IO callback yields
+                // zero frames. The 8s watchdog is the most reliable signal we get.
+                // Surface the actual cause instead of a generic "route mismatch"
+                // hint so the user knows what to change.
+                // The same-device-input-output limitation is a CoreAudio Process Tap
+                // constraint — only relevant on macOS. detectSameInputOutputDevice
+                // is itself macOS-specific; skip the check on other platforms.
+                const sameDeviceName = process.platform === 'darwin'
+                    ? this.detectSameInputOutputDevice()
+                    : null;
+                if (sameDeviceName) {
+                    const msg = formatPermissionMessage('mac-same-device-input-output', { device: sameDeviceName });
+                    console.warn(`${prefix}SystemAudioCapture ${msg}`);
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'system',
+                        message: msg,
+                        attempt: 0,
+                        maxAttempts: 3,
+                        terminal: false,
+                        stuck: true,
+                    });
+                    return;
+                }
+                console.warn(`${prefix}SystemAudioCapture produced 0 chunks in 8s — likely silent capture (route mismatch or permission revoked).`);
+                this.broadcast('audio-capture-failed', {
+                    channel: 'system',
+                    message: formatPermissionMessage('system-audio-stuck'),
+                    attempt: 0,
+                    maxAttempts: 3,
+                    terminal: false,
+                    stuck: true,
+                });
+            }, 8000);
+        };
+        // TCC zero-fill detector. Apple's CoreAudio Process Tap returns zero-filled
+        // buffers (instead of an OSStatus error) when the launched binary's
+        // Screen Recording / audio-capture grant doesn't apply — typically after a
+        // dev rebuild changes the bundle signature, or when the user revokes the
+        // grant mid-session. Symptom: the IO proc fires at the correct cadence and
+        // chunks flow normally, but every f32 sample is 0.0. Without a dedicated
+        // detector, the no-chunks watchdog above never fires and the user just sees
+        // an empty interviewer transcript with no idea why.
+        //
+        // Strategy: track the absolute peak of every chunk (cheap — 960 i16s per
+        // 20ms chunk). After we've seen ZEROFILL_OBSERVATION_MS of nothing but
+        // peak==0 chunks, broadcast a TCC-specific banner. Latch off the detector
+        // permanently as soon as we see a single non-zero peak so a quiet meeting
+        // doesn't trigger the warning later. The latency budget intentionally
+        // exceeds the no-chunks watchdog (8s) so the two banners don't race.
+        const ZEROFILL_OBSERVATION_MS = 12000;
+        let firstChunkAt = 0;
+        let zerofillLatched = false; // true once a non-zero peak has been observed (detector off)
+        let zerofillTriggered = false; // true once we've already broadcast — prevent repeats
+        capture.on('start', armStuckWatchdog);
+        capture.on('stop', () => {
+            if (stuckTimer) {
+                clearTimeout(stuckTimer);
+                stuckTimer = null;
+            }
+        });
+        // Inter-chunk gap tracking. Normal cadence is one 20ms chunk every 20ms
+        // (so ~50/sec). A gap >2s while the meeting is active and the capture is
+        // still wired indicates a transient route change (AirPods plug/unplug,
+        // HDMI attach, USB hot-plug). The 8s no-chunks watchdog above catches
+        // longer outages; this just logs the in-between case so anyone reading
+        // logs can correlate "transcript stuttered" with a route change instead
+        // of suspecting STT or network problems. Deliberately not promoted to a
+        // UI banner — that would spam during normal device juggling.
+        let lastChunkAt = 0;
+        capture.on('data', (chunk) => {
+            const now = Date.now();
+            if (lastChunkAt > 0) {
+                const gap = now - lastChunkAt;
+                if (gap > 2000 && gap < 8000) {
+                    console.warn(`${prefix}SystemAudio chunk gap ${gap}ms — likely transient route change. Resuming.`);
+                }
+            }
+            lastChunkAt = now;
+            chunkCount++;
+            if (chunkCount === 1 && stuckTimer) {
+                clearTimeout(stuckTimer);
+                stuckTimer = null;
+            }
+            if (!this._sysSttRateApplied && this.googleSTT && this.systemAudioCapture === capture) {
+                const rate = capture.getSampleRate();
+                this.googleSTT.setSampleRate(rate);
+                this.googleSTT.setAudioChannelCount?.(1);
+                this._sysSttRateApplied = true;
+                console.log(`${prefix}Interviewer STT rate locked from first chunk: ${rate}Hz`);
+            }
+            if (chunkCount <= 3 || chunkCount % 500 === 0) {
+                console.log(`${prefix}SystemAudio->STT: chunk #${chunkCount}, ${chunk.length}B, googleSTT=${this.googleSTT ? 'active' : 'NULL'}`);
+            }
+            // TCC zero-fill check. macOS-specific: WASAPI loopback on Windows does
+            // not produce sustained zero-fill on permission revocation, so the
+            // detector has no diagnostic value off Darwin and the suggested fix
+            // (System Settings → Screen Recording) doesn't apply.
+            if (process.platform === 'darwin' && !zerofillLatched && !zerofillTriggered) {
+                if (firstChunkAt === 0)
+                    firstChunkAt = Date.now();
+                // Stride-sample 16 samples across the chunk — sufficient to catch any
+                // real audio content, ~32× cheaper than scanning all 960 samples.
+                let peak = 0;
+                const stride = Math.max(2, (chunk.length >> 5) & ~1); // even byte offset
+                for (let i = 0; i + 1 < chunk.length; i += stride) {
+                    const s = chunk.readInt16LE(i);
+                    const a = s < 0 ? -s : s;
+                    if (a > peak) {
+                        peak = a;
+                        if (peak > 8)
+                            break;
+                    }
+                }
+                if (peak > 8) {
+                    // Real audio observed — disable the detector for the rest of the session.
+                    zerofillLatched = true;
+                }
+                else if (Date.now() - firstChunkAt >= ZEROFILL_OBSERVATION_MS) {
+                    zerofillTriggered = true;
+                    console.warn(`${prefix}SystemAudio chunks all zero-filled for ${ZEROFILL_OBSERVATION_MS / 1000}s — TCC denial suspected (Screen Recording grant may not apply to this binary).`);
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'system',
+                        message: formatPermissionMessage('mac-screen-recording-revoked-rebuild'),
+                        attempt: 0,
+                        maxAttempts: 3,
+                        terminal: false,
+                        stuck: true,
+                    });
+                }
+            }
+            this.googleSTT?.write(chunk);
+        });
+        capture.on('sample_rate_changed', (rate) => {
+            console.log(`${prefix}SystemAudioCapture rate updated dynamically to ${rate}Hz`);
+            this.googleSTT?.setSampleRate(rate);
+        });
+        capture.on('speech_ended', () => {
+            this.googleSTT?.notifySpeechEnded?.();
+        });
+        // setupAudioRecoveryHandler registers its own 'error' listener — do not
+        // add a duplicate logger here or the same error reports twice.
+        this.setupAudioRecoveryHandler();
+    }
+    wireMicCapture(capture, label = '') {
+        const prefix = label ? `[Main] ${label} ` : '[Main] ';
+        let chunkCount = 0;
+        // Mirror of the system-audio stuck watchdog: if the cpal callback never
+        // produces samples within 8s of start (USB mic that disappears on open,
+        // exclusive-mode contention with another app, default device returning
+        // a handle that's actually muted), surface a clear UI signal instead of
+        // letting the user transcript silently die.
+        let stuckTimer = null;
+        const armStuckWatchdog = () => {
+            if (stuckTimer)
+                clearTimeout(stuckTimer);
+            stuckTimer = setTimeout(() => {
+                if (this.microphoneCapture !== capture)
+                    return;
+                if (chunkCount > 0)
+                    return;
+                if (!this.isMeetingActive)
+                    return;
+                console.warn(`${prefix}MicrophoneCapture produced 0 chunks in 8s — likely silent capture (device contention, hot-unplug, or muted input).`);
+                this.broadcast('audio-capture-failed', {
+                    channel: 'mic',
+                    message: 'No audio detected from your microphone for 8s. Check that your input device is unmuted and not in use by another app.',
+                    attempt: 0,
+                    maxAttempts: 3,
+                    terminal: false,
+                    stuck: true,
+                });
+            }, 8000);
+        };
+        capture.on('start', armStuckWatchdog);
+        capture.on('stop', () => {
+            if (stuckTimer) {
+                clearTimeout(stuckTimer);
+                stuckTimer = null;
+            }
+        });
+        // Inter-chunk gap tracking — see wireSystemCapture for rationale.
+        let lastChunkAt = 0;
+        // Mic TCC / muted-input zero-fill detector. cpal will happily open a mic
+        // stream and deliver silent (peak=0) buffers when:
+        //   - macOS Microphone permission was revoked between TCC check and start,
+        //   - the OS muted the input via the menu bar mic indicator,
+        //   - the hardware mic is physically muted (some Jabra/Bose headsets),
+        //   - exclusive-mode contention with a meeting app (Zoom/Teams) on Windows.
+        // Same shape as the system tap zero-fill: chunks arrive on cadence but every
+        // sample is 0. Without this, the user just sees an empty user transcript
+        // and assumes the meeting itself is broken.
+        const ZEROFILL_OBSERVATION_MS = 12000;
+        let firstChunkAt = 0;
+        let zerofillLatched = false;
+        let zerofillTriggered = false;
+        capture.on('data', (chunk) => {
+            const now = Date.now();
+            if (lastChunkAt > 0) {
+                const gap = now - lastChunkAt;
+                if (gap > 2000 && gap < 8000) {
+                    console.warn(`${prefix}Mic chunk gap ${gap}ms — likely transient device change (USB hot-plug, BT reconnect). Resuming.`);
+                }
+            }
+            lastChunkAt = now;
+            chunkCount++;
+            if (chunkCount === 1 && stuckTimer) {
+                clearTimeout(stuckTimer);
+                stuckTimer = null;
+            }
+            if (!this._micSttRateApplied && this.googleSTT_User && this.microphoneCapture === capture) {
+                const rate = capture.getSampleRate();
+                this.googleSTT_User.setSampleRate(rate);
+                this.googleSTT_User.setAudioChannelCount?.(1);
+                this._micSttRateApplied = true;
+                console.log(`${prefix}User STT rate locked from first mic chunk: ${rate}Hz`);
+            }
+            if (!zerofillLatched && !zerofillTriggered) {
+                if (firstChunkAt === 0)
+                    firstChunkAt = now;
+                let peak = 0;
+                const stride = Math.max(2, (chunk.length >> 5) & ~1);
+                for (let i = 0; i + 1 < chunk.length; i += stride) {
+                    const s = chunk.readInt16LE(i);
+                    const a = s < 0 ? -s : s;
+                    if (a > peak) {
+                        peak = a;
+                        if (peak > 8)
+                            break;
+                    }
+                }
+                if (peak > 8) {
+                    zerofillLatched = true;
+                }
+                else if (now - firstChunkAt >= ZEROFILL_OBSERVATION_MS) {
+                    zerofillTriggered = true;
+                    console.warn(`${prefix}Mic chunks all zero-filled for ${ZEROFILL_OBSERVATION_MS / 1000}s — TCC denial or device-mute suspected.`);
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'mic',
+                        message: formatPermissionMessage('mic-zero-fill'),
+                        attempt: 0,
+                        maxAttempts: 3,
+                        terminal: false,
+                        stuck: true,
+                    });
+                }
+            }
+            this.googleSTT_User?.write(chunk);
+        });
+        capture.on('sample_rate_changed', (rate) => {
+            console.log(`${prefix}MicrophoneCapture rate updated dynamically to ${rate}Hz`);
+            this.googleSTT_User?.setSampleRate(rate);
+        });
+        capture.on('speech_ended', () => {
+            this.googleSTT_User?.notifySpeechEnded?.();
+        });
+        // setupMicRecoveryHandler registers its own 'error' listener.
+        this.setupMicRecoveryHandler();
+    }
+    setupSystemAudioPipeline() {
+        // REMOVED EARLY RETURN: if (this.systemAudioCapture && this.microphoneCapture) return; // Already initialized
+        try {
+            // 1. Initialize Captures if missing
+            // If they already exist (e.g. from reconfigureAudio), they are already wired to write to this.googleSTT/User
+            if (!this.systemAudioCapture) {
+                // Hard fast-fail when Screen Recording is explicitly denied. Without this
+                // guard, SystemAudioCapture spawns a Rust BG thread that tries CoreAudio
+                // Tap (fails immediately), then ScreenCaptureKit (10s timeout waiting on
+                // a permission callback that never fires), emits 'error', triggers the
+                // recovery handler 3x — total ~30s of dead air with no UI signal. By
+                // checking the TCC status up front we keep the meeting in mic-only mode
+                // and broadcast a clear banner so the user knows.
+                if (process.platform === 'darwin' && getMacScreenCaptureStatus() === 'denied') {
+                    console.warn('[Main] Skipping SystemAudioCapture init — Screen Recording permission denied. Meeting will run mic-only.');
+                    this.broadcast('system-audio-permission-denied', formatPermissionMessage('screen-recording-denied'));
+                    this.broadcastDeviceSelection({
+                        kind: 'output',
+                        requested: null,
+                        actual: null,
+                        fellBack: true,
+                        reason: 'screen-recording-permission-denied',
+                    });
+                }
+                else {
+                    this.systemAudioCapture = new SystemAudioCapture_1.SystemAudioCapture();
+                    this.wireSystemCapture(this.systemAudioCapture);
+                    // Transparency: tell the renderer which device is actually being captured
+                    // even on the no-metadata default path. Previously only reconfigureAudio
+                    // broadcast this, so a meeting started without an explicit device choice
+                    // left the UI in the dark about whether system audio was using the
+                    // expected output route.
+                    this.broadcastDeviceSelection({
+                        kind: 'output',
+                        requested: null,
+                        actual: 'default',
+                        fellBack: false,
+                    });
+                }
+            }
+            if (!this.microphoneCapture) {
+                this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture();
+                this.wireMicCapture(this.microphoneCapture);
+            }
+            // 2. Initialize STT Services if missing
+            // STT init wraps each createSTTProvider in its own try/catch so a single
+            // provider failure (bad API key, missing credentials file, network error
+            // during constructor) doesn't break the entire pipeline AND the user gets
+            // a specific UI signal instead of the generic "no transcript" experience.
+            const { CredentialsManager } = require('./services/CredentialsManager');
+            const sttProv = CredentialsManager.getInstance().getSttProvider();
+            if (!this.googleSTT) {
+                console.log(`[Main] Creating interviewer STT provider: ${sttProv}`);
+                try {
+                    this.googleSTT = this.createSTTProvider('interviewer');
+                }
+                catch (sttErr) {
+                    console.error(`[Main] Interviewer STT init failed (${sttProv}):`, sttErr);
+                    this.googleSTT = null;
+                }
+                if (!this.googleSTT) {
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'system',
+                        message: `Speech-to-text provider "${sttProv}" failed to initialize for the interviewer channel. Check your API key and credentials in Settings.`,
+                        attempt: 0,
+                        maxAttempts: 0,
+                        terminal: true,
+                        stuck: false,
+                    });
+                }
+            }
+            if (!this.googleSTT_User) {
+                console.log(`[Main] Creating user STT provider: ${sttProv}`);
+                try {
+                    this.googleSTT_User = this.createSTTProvider('user');
+                }
+                catch (sttErr) {
+                    console.error(`[Main] User STT init failed (${sttProv}):`, sttErr);
+                    this.googleSTT_User = null;
+                }
+                if (!this.googleSTT_User) {
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'mic',
+                        message: `Speech-to-text provider "${sttProv}" failed to initialize for the microphone channel. Check your API key and credentials in Settings.`,
+                        attempt: 0,
+                        maxAttempts: 0,
+                        terminal: true,
+                        stuck: false,
+                    });
+                }
+            }
+            // STT sample rate is now applied lazily on the first chunk arrival
+            // (see the 'data' handlers above). Pre-configuring here was racy because
+            // SystemAudioCapture's monitor doesn't exist until start() and returns
+            // the constructor default (48000) until the native bg-init thread
+            // publishes the real rate — which on Windows after Fix #2 is known
+            // synchronously, but on macOS CoreAudio Tap takes ~5-7s to propagate.
+            this._sysSttRateApplied = false;
+            this._micSttRateApplied = false;
+            if (this._verboseLogging)
+                console.log('[Main] Full Audio Pipeline (System + Mic) Initialized (Ready)');
+        }
+        catch (err) {
+            console.error('[Main] Failed to setup System Audio Pipeline:', err);
+        }
+    }
+    /**
+     * PERF: Pre-construct STT provider objects at app launch so the meeting-start
+     * critical path doesn't pay for createSTTProvider (which does CredentialsManager
+     * lookup + listener wiring + per-provider class init).
+     *
+     * NOTE: this only constructs the JS objects. Provider sockets are still opened
+     * lazily on first .write() / .start() — opening idle sockets at app launch
+     * would burn provider quota and is provider-specific behavior we don't want
+     * to assume. The actual streaming-WebSocket cold-start is a separate (larger)
+     * optimization that should be done per-provider.
+     *
+     * Safe to call multiple times: existence guards in setupSystemAudioPipeline
+     * prevent duplicate construction.
+     */
+    prewarmSttProviders() {
+        if (this.googleSTT && this.googleSTT_User)
+            return;
+        try {
+            if (!this.googleSTT) {
+                console.log('[Main] Pre-warming interviewer STT provider...');
+                this.googleSTT = this.createSTTProvider('interviewer');
+            }
+            if (!this.googleSTT_User) {
+                console.log('[Main] Pre-warming user STT provider...');
+                this.googleSTT_User = this.createSTTProvider('user');
+            }
+        }
+        catch (err) {
+            // Pre-warm failure is non-fatal; setupSystemAudioPipeline will retry on
+            // first meeting start with full error handling.
+            console.warn('[Main] STT pre-warm failed (will retry on meeting start):', err);
+        }
+    }
+    /**
+     * Restart system + mic captures after a macOS sleep/wake cycle.
+     *
+     * Why this exists: when the laptop sleeps (lid close, "Sleep" menu, idle
+     * timeout), CoreAudio invalidates the AggregateDevice handle, the SCK
+     * stream silently dies, and the Process Tap stops delivering buffers. On
+     * resume the OS doesn't notify our IO proc, so the captures sit there
+     * looking healthy (chunkCount > 0 from before sleep, isRecording=true)
+     * but never produce another chunk. The 8s no-chunks watchdog *would*
+     * eventually fire, but only on the path where chunkCount stays at 0 — it
+     * doesn't help mid-meeting after we've already seen audio.
+     *
+     * The WS connection is similarly half-dead: TCP keepalive won't notice
+     * for 2+ hours on macOS, and meanwhile the renderer shows a frozen
+     * transcript and a "Connected" badge.
+     *
+     * Cleanest fix: on system resume, if a meeting is active, destroy and
+     * recreate both captures using the same device IDs the user originally
+     * picked. The STT WS will close as a side effect of the capture stop and
+     * reconnect via the existing scheduleReconnect path. Total dead air is
+     * ~500ms — a small price for guaranteed recovery.
+     */
+    async restartCapturesAfterResume() {
+        if (!this.isMeetingActive) {
+            console.log('[Main] System resume — no active meeting, nothing to restart.');
+            return;
+        }
+        console.log('[Main] System resume — restarting captures so CoreAudio/cpal handles are fresh.');
+        // System audio (CoreAudio Tap is the most fragile across sleep cycles).
+        if (this.systemAudioCapture) {
+            try {
+                this.systemAudioCapture.destroy();
+            }
+            catch (e) {
+                console.warn('[Main] Resume: system capture destroy threw:', e);
+            }
+            this.systemAudioCapture = null;
+        }
+        try {
+            this.systemAudioCapture = new SystemAudioCapture_1.SystemAudioCapture(this._lastRequestedOutputDeviceId);
+            this._sysSttRateApplied = false;
+            this.wireSystemCapture(this.systemAudioCapture, '(Resume)');
+            this.systemAudioCapture.start();
+        }
+        catch (err) {
+            console.error('[Main] Resume: failed to restart system capture:', err);
+            this.broadcast('audio-capture-failed', {
+                channel: 'system',
+                message: 'System audio capture failed to restart after wake. End and restart the meeting to recover.',
+                attempt: 0,
+                maxAttempts: 0,
+                terminal: true,
+                stuck: false,
+            });
+        }
+        // Mic — usually survives sleep but recreate to be safe; cpal exclusive
+        // mode on Windows can silently drop the stream.
+        if (this.microphoneCapture) {
+            try {
+                this.microphoneCapture.destroy();
+            }
+            catch (e) {
+                console.warn('[Main] Resume: mic capture destroy threw:', e);
+            }
+            this.microphoneCapture = null;
+        }
+        try {
+            this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture(this._lastRequestedInputDeviceId);
+            this._micSttRateApplied = false;
+            this.wireMicCapture(this.microphoneCapture, '(Resume)');
+            this.microphoneCapture.start();
+        }
+        catch (err) {
+            console.error('[Main] Resume: failed to restart mic capture:', err);
+            this.broadcast('audio-capture-failed', {
+                channel: 'mic',
+                message: 'Microphone failed to restart after wake. Check that no other app holds the mic, then end and restart the meeting.',
+                attempt: 0,
+                maxAttempts: 0,
+                terminal: true,
+                stuck: false,
+            });
+        }
+    }
+    /**
+     * Broadcast which device the main process actually opened, vs what the
+     * renderer requested. Renderer subscribes to this so it can show a banner
+     * when fallback to default occurred (e.g. saved AirPods name no longer in
+     * the cpal list because they're disconnected). Without this signal the UI
+     * shows "AirPods selected" but capture is silently using built-in mic.
+     */
+    broadcastDeviceSelection(payload) {
+        console.log(`[Main] device-selection-applied:`, payload);
+        this.broadcast('device-selection-applied', payload);
+    }
+    /**
+     * Normalize a device id from the renderer/localStorage into the canonical
+     * "use the system default" form (undefined). Treats null, empty string, and
+     * the literal sentinel "default" as equivalent to "no preference".
+     *
+     * This matters because Rust's `list_input_devices()` returns ("default",
+     * "Default Microphone") as the first option, so the renderer's "Default"
+     * dropdown choice gets persisted as the literal string "default" — which
+     * is truthy in JS and would otherwise:
+     *   - defeat the default-output watcher's `_lastRequestedOutputDeviceId`
+     *     guard (it skipped polling for users on Default because the field
+     *     was the truthy string "default" instead of undefined),
+     *   - leave the reconfigureAudio device-id comparison dependent on the
+     *     exact string the renderer happened to send,
+     *   - cause the mic recovery handler to attempt recreation with the
+     *     literal "default" string (which Rust handles correctly, but only
+     *     because of explicit special-casing in microphone.rs/sck.rs).
+     * Centralizing the normalization here keeps every downstream consumer on
+     * the same page about what "default" actually means.
+     */
+    normalizeDeviceId(id) {
+        if (!id)
+            return undefined;
+        const trimmed = id.trim();
+        if (!trimmed)
+            return undefined;
+        if (trimmed.toLowerCase() === 'default')
+            return undefined;
+        return trimmed;
+    }
+    /**
+     * Detect the case where the requested input and output devices are the same
+     * physical hardware (typically AirPods on both sides). Input IDs come from
+     * cpal (device name), output IDs come from CoreAudio (UID with optional
+     * :input/:output suffix), so direct string comparison won't catch the
+     * conflict. We resolve the output UID to a friendly name via
+     * AudioDevices.getOutputDevices() and compare it to the input name (case-
+     * insensitive). Returns the friendly name when a same-device conflict is
+     * detected, undefined otherwise.
+     */
+    detectSameInputOutputDevice() {
+        return this.checkSameInputOutputDevice(this._lastRequestedInputDeviceId, this._lastRequestedOutputDeviceId);
+    }
+    /**
+     * Pure variant of detectSameInputOutputDevice that takes the IDs as args
+     * instead of reading from instance state. Used by reconfigureAudio so the
+     * conflict check runs against the INCOMING request before instance state
+     * is mutated, which would otherwise interact badly with the skip-if-
+     * unchanged early-exit.
+     */
+    checkSameInputOutputDevice(inputId, outputId) {
+        if (!inputId || !outputId)
+            return undefined;
+        // Strip the macOS CoreAudio :input/:output suffix before any comparison —
+        // a single Bluetooth device can appear with both suffixes.
+        const stripSuffix = (s) => s.replace(/:(input|output)$/i, '');
+        const inputBase = stripSuffix(inputId).toLowerCase();
+        const outputBase = stripSuffix(outputId).toLowerCase();
+        if (inputBase === outputBase) {
+            return stripSuffix(inputId);
+        }
+        // Resolve the output UID to its friendly name and compare to the input
+        // name (input IDs from cpal ARE the device name, e.g. "Evin's AirPods Pro").
+        try {
+            const outputs = AudioDevices_1.AudioDevices.getOutputDevices();
+            const outputMatch = outputs.find(d => stripSuffix(d.id).toLowerCase() === outputBase);
+            if (outputMatch && outputMatch.name) {
+                if (outputMatch.name.toLowerCase() === inputId.toLowerCase()) {
+                    return outputMatch.name;
+                }
+            }
+        }
+        catch {
+            // Native module unavailable — fall through to "no conflict detected".
+        }
+        return undefined;
+    }
+    /**
+     * Pick the best mic to use when the requested input conflicts with the
+     * audio output (same physical device — typically AirPods on both sides).
+     * Built-in mics get first preference because they are always available
+     * and never participate in the Bluetooth aggregate that's blocking the
+     * tap. Falls back to any other input that isn't the conflicting device.
+     * Returns undefined if nothing else is plugged in.
+     */
+    pickFallbackInputDevice(conflictingName) {
+        try {
+            const inputs = AudioDevices_1.AudioDevices.getInputDevices();
+            if (!inputs?.length)
+                return undefined;
+            const stripSuffix = (s) => s.replace(/:(input|output)$/i, '');
+            const conflictBase = stripSuffix(conflictingName).toLowerCase();
+            const isConflicting = (d) => stripSuffix(d.id).toLowerCase() === conflictBase ||
+                d.name.toLowerCase() === conflictBase;
+            // Built-in mics on macOS show up as "MacBook Pro Microphone" / "MacBook
+            // Air Microphone" / "Built-in Microphone" / "iMac Microphone". Match
+            // loosely so we don't miss future Apple naming changes.
+            const isBuiltIn = (d) => /macbook|built[- ]?in|imac|mac\s+studio|mac\s+mini/i.test(d.name);
+            return inputs.find(d => !isConflicting(d) && isBuiltIn(d))
+                ?? inputs.find(d => !isConflicting(d));
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async reconfigureAudio(inputDeviceId, outputDeviceId) {
+        console.log(`[Main] Reconfiguring Audio: Input=${inputDeviceId}, Output=${outputDeviceId}`);
+        // PERF: skip the entire destroy+recreate cycle when neither device changed
+        // since the last reconfigure AND both captures already exist. Each
+        // destroy()+new() costs 50–200ms (macOS CoreAudio Tap re-init, Windows
+        // WASAPI device contention, CPAL stream open). The common case — user
+        // starts a second meeting with the same mic/speakers — hits this path.
+        let wantedInput = this.normalizeDeviceId(inputDeviceId);
+        const wantedOutput = this.normalizeDeviceId(outputDeviceId);
+        // Auto-fallback for the "same device on both sides" conflict (most common
+        // with AirPods used for both listening and the meeting mic). macOS won't
+        // tap a device while it's also the active microphone — the system audio
+        // capture would silently produce zero-filled buffers and the interviewer
+        // transcript would stay empty. Switch the mic to a non-conflicting input
+        // (built-in preferred) so the user can keep their headphones for audio
+        // output without touching system settings.
+        //
+        // This check runs BEFORE the skip-if-unchanged comparison so the skip
+        // path uses the post-fallback wantedInput. Otherwise a stale identical
+        // request could short-circuit a needed re-resolution (e.g., user
+        // unplugged the built-in fallback after the first reconfigure).
+        if (wantedInput && wantedOutput) {
+            const conflict = this.checkSameInputOutputDevice(wantedInput, wantedOutput);
+            if (conflict) {
+                const fallback = this.pickFallbackInputDevice(conflict);
+                if (fallback) {
+                    console.warn(`[Main] I/O conflict detected (${conflict} on both sides). Auto-switching mic to "${fallback.name}".`);
+                    wantedInput = this.normalizeDeviceId(fallback.id);
+                    this.broadcast('audio-input-auto-switched', {
+                        from: conflict,
+                        to: fallback.name,
+                        reason: 'same-device-conflict',
+                    });
+                }
+                else {
+                    console.warn(`[Main] I/O conflict detected (${conflict}) but no alternate input available — system audio will likely be silent.`);
+                }
+            }
+        }
+        if (this.systemAudioCapture &&
+            this.microphoneCapture &&
+            this._lastRequestedInputDeviceId === wantedInput &&
+            this._lastRequestedOutputDeviceId === wantedOutput) {
+            console.log('[Main] Audio reconfigure skipped — device IDs unchanged.');
+            return;
+        }
+        // Remember the (possibly fallback-overridden) input id so the mic-recovery
+        // handler can recreate with the same selection if the cpal stream errors
+        // out mid-meeting.
+        this._lastRequestedInputDeviceId = wantedInput;
+        this._lastRequestedOutputDeviceId = wantedOutput;
+        // Reset mic recovery counter for the new device choice.
+        this._micRecoveryAttempts = 0;
+        // 1. System Audio (Output Capture)
+        if (this.systemAudioCapture) {
+            // destroy() calls stop() AND removeAllListeners(), preventing EventEmitter listener leaks.
+            // Using stop()+null would orphan all 'data', 'speech_ended', 'sample_rate_changed'
+            // closures (they still hold a ref to `this`) and trigger them on the next meeting.
+            this.systemAudioCapture.destroy();
+            this.systemAudioCapture = null;
+        }
+        try {
+            console.log('[Main] Initializing SystemAudioCapture...');
+            this.systemAudioCapture = new SystemAudioCapture_1.SystemAudioCapture(wantedOutput);
+            this._sysSttRateApplied = false;
+            this.wireSystemCapture(this.systemAudioCapture, '(Reconfigured)');
+            console.log('[Main] SystemAudioCapture initialized.');
+            this.broadcastDeviceSelection({
+                kind: 'output',
+                requested: wantedOutput || null,
+                actual: wantedOutput || 'default',
+                fellBack: false,
+            });
+        }
+        catch (err) {
+            console.warn('[Main] Failed to initialize SystemAudioCapture with preferred ID. Falling back to default.', err);
+            try {
+                this.systemAudioCapture = new SystemAudioCapture_1.SystemAudioCapture(); // Default
+                this._sysSttRateApplied = false;
+                this.wireSystemCapture(this.systemAudioCapture, '(Default)');
+                this.broadcastDeviceSelection({
+                    kind: 'output',
+                    requested: wantedOutput || null,
+                    actual: 'default',
+                    fellBack: true,
+                    reason: err?.message || 'unknown',
+                });
+            }
+            catch (err2) {
+                console.error('[Main] Failed to initialize SystemAudioCapture (Default):', err2);
+                this.broadcastDeviceSelection({
+                    kind: 'output',
+                    requested: wantedOutput || null,
+                    actual: null,
+                    fellBack: true,
+                    reason: `Both preferred and default failed: ${err2?.message || 'unknown'}`,
+                });
+            }
+        }
+        // 2. Microphone (Input Capture)
+        if (this.microphoneCapture) {
+            // destroy() calls stop() AND removeAllListeners(), preventing EventEmitter listener leaks.
+            this.microphoneCapture.destroy();
+            this.microphoneCapture = null;
+        }
+        try {
+            console.log('[Main] Initializing MicrophoneCapture...');
+            this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture(wantedInput);
+            this._micSttRateApplied = false;
+            this.wireMicCapture(this.microphoneCapture, '(Reconfigured)');
+            console.log('[Main] MicrophoneCapture initialized.');
+            this.broadcastDeviceSelection({
+                kind: 'input',
+                requested: wantedInput || null,
+                actual: wantedInput || 'default',
+                fellBack: false,
+            });
+        }
+        catch (err) {
+            console.warn('[Main] Failed to initialize MicrophoneCapture with preferred ID. Falling back to default.', err);
+            try {
+                this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture(); // Default
+                this._micSttRateApplied = false;
+                this.wireMicCapture(this.microphoneCapture, '(Default)');
+                this.broadcastDeviceSelection({
+                    kind: 'input',
+                    requested: wantedInput || null,
+                    actual: 'default',
+                    fellBack: true,
+                    reason: err?.message || 'unknown',
+                });
+            }
+            catch (err2) {
+                // Third-level fallback: enumerate every available input device and try
+                // each in order. Common case where this matters: user has only
+                // Bluetooth-HFP mics available (AirPods/Sony XM5), one of which
+                // returns an unsupported sample format from cpal. Without this,
+                // both `wantedInput` and `default` could be the SAME failing device,
+                // and the user is left with a meeting that has zero mic input.
+                console.warn('[Main] Default mic also failed. Enumerating remaining input devices to try each.', err2);
+                const tried = new Set([
+                    wantedInput ?? '',
+                    'default',
+                ].filter(Boolean));
+                const candidates = AudioDevices_1.AudioDevices.getInputDevices()
+                    .map((d) => d.id)
+                    .filter((id) => id && !tried.has(id));
+                let success = false;
+                let lastErr = err2;
+                for (const candidateId of candidates) {
+                    try {
+                        console.log(`[Main] Trying mic fallback candidate: ${candidateId}`);
+                        this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture(candidateId);
+                        this._micSttRateApplied = false;
+                        this.wireMicCapture(this.microphoneCapture, `(Fallback:${candidateId})`);
+                        this.broadcastDeviceSelection({
+                            kind: 'input',
+                            requested: wantedInput || null,
+                            actual: candidateId,
+                            fellBack: true,
+                            reason: `Preferred and default failed; using ${candidateId}.`,
+                        });
+                        success = true;
+                        break;
+                    }
+                    catch (errN) {
+                        lastErr = errN;
+                        console.warn(`[Main] Fallback candidate ${candidateId} failed:`, errN);
+                    }
+                }
+                if (!success) {
+                    console.error('[Main] All input devices failed to initialize.', lastErr);
+                    this.microphoneCapture = null;
+                    this.broadcastDeviceSelection({
+                        kind: 'input',
+                        requested: wantedInput || null,
+                        actual: null,
+                        fellBack: true,
+                        reason: `All ${candidates.length + 2} input devices failed: ${lastErr?.message || 'unknown'}`,
+                    });
+                    // Surface to UI so the user knows the meeting will be system-audio-only.
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'mic',
+                        message: 'No working microphone could be initialized. Disconnect and reconnect your audio devices, or restart the app.',
+                        attempt: 0,
+                        maxAttempts: 0,
+                        terminal: true,
+                        stuck: false,
+                    });
+                }
+            }
+        }
+    }
+    /**
+     * Reconfigure STT provider mid-session (called from IPC when user changes provider)
+     * Destroys existing STT instances and recreates them with the new provider
+     */
+    async reconfigureSttProvider() {
+        console.log('[Main] Reconfiguring STT Provider...');
+        // RC-01 fix: pause audio captures FIRST so their EventEmitter queues drain
+        // before we null-out the STT instances. Without this, buffered 'data' events
+        // still in-flight call this.googleSTT?.write() while googleSTT is already null.
+        if (this.isMeetingActive) {
+            this.systemAudioCapture?.stop();
+            this.microphoneCapture?.stop();
+        }
+        // Now safe to destroy STT instances — no more audio events incoming
+        if (this.googleSTT) {
+            this.googleSTT.stop();
+            this.googleSTT.removeAllListeners();
+            this.googleSTT = null;
+        }
+        if (this.googleSTT_User) {
+            this.googleSTT_User.stop();
+            this.googleSTT_User.removeAllListeners();
+            this.googleSTT_User = null;
+        }
+        // Only reinitialize the pipeline when a meeting is already active.
+        // Outside a meeting, defer pipeline creation to startMeeting() so we never
+        // eagerly construct a MicrophoneCapture (which calls build_input_stream on
+        // macOS and immediately triggers the orange mic indicator even without .play()).
+        if (this.isMeetingActive) {
+            this.setupSystemAudioPipeline();
+            this.systemAudioCapture?.start();
+            this.microphoneCapture?.start();
+            this.googleSTT?.start();
+            this.googleSTT_User?.start();
+        }
+        console.log('[Main] STT Provider reconfigured');
+        // Broadcast the new STT config state to all windows so they can update banners / warnings
+        const { CredentialsManager: CM } = require('./services/CredentialsManager');
+        const newProvider = CM.getInstance().getSttProvider();
+        this.broadcast('stt-config-changed', { configured: newProvider !== 'none', provider: newProvider });
+    }
+    /**
+     * PR #173: Audio Recovery Handler
+     *
+     * Listens for 'audio-capture-failed' emit from SystemAudioCapture and
+     * transparently restarts the full capture + STT pipeline without ending the
+     * meeting session. Prevents silent audio loss when macOS CoreAudio or SCK
+     * drops the capture stream mid-session (e.g. device re-plug, Display Sleep).
+     */
+    _systemAudioRecoveryInProgress = false;
+    _systemAudioRecoveryAttempts = 0;
+    _systemAudioRecoveryTimer = null;
+    _systemAudioLastFailureAt = null;
+    _systemAudioSuccessfulRestarts = 0;
+    _systemAudioConsecutiveFailures = 0;
+    setupAudioRecoveryHandler() {
+        if (!this.systemAudioCapture)
+            return;
+        this.systemAudioCapture.on('error', async (err) => {
+            if (!this.isMeetingActive)
+                return; // Only attempt recovery during active meetings
+            const now = Date.now();
+            this._systemAudioLastFailureAt = now;
+            this._systemAudioConsecutiveFailures++;
+            // Cap at 3 consecutive recovery attempts to avoid infinite restart loops
+            if (this._systemAudioRecoveryInProgress || this._systemAudioRecoveryAttempts >= 3) {
+                console.warn(`[AudioRecovery] Skipping recovery — already in progress or max attempts (${this._systemAudioRecoveryAttempts}/3) reached.`);
+                return;
+            }
+            this._systemAudioRecoveryInProgress = true;
+            this._systemAudioRecoveryAttempts++;
+            console.warn(`[AudioRecovery] SystemAudioCapture error — attempting recovery #${this._systemAudioRecoveryAttempts}: ${err.message}`);
+            // Surface the failure to the UI so the user sees the actual cause (e.g.
+            // "ScreenCaptureKit access denied", "No displays found") instead of just
+            // a generic STT 'reconnecting' indicator. This event is non-fatal — the
+            // recovery attempt may still succeed.
+            this.broadcast('audio-capture-failed', {
+                channel: 'system',
+                message: err.message,
+                attempt: this._systemAudioRecoveryAttempts,
+                maxAttempts: 3,
+            });
+            try {
+                // Brief delay so the OS can release the device before re-acquisition
+                await new Promise(resolve => {
+                    this._systemAudioRecoveryTimer = setTimeout(resolve, 1500);
+                });
+                this._systemAudioRecoveryTimer = null;
+                // Recovery via destroy+recreate, NOT stop()+start():
+                //   - SystemAudioCapture.stop() defers the native teardown via setImmediate
+                //     so the synchronously-following start() runs while the Rust capture_thread
+                //     is still Some, and Rust's start() returns "Capture already running".
+                //   - The deferred stop also leaves the SCK/CoreAudio Tap holding device
+                //     resources, so even if start() succeeded the BG thread couldn't
+                //     re-acquire them.
+                // destroy() (called via the new instance shadow) synchronously removes
+                // listeners; the old monitor's stop/join still completes in setImmediate.
+                // The new instance has its own fresh state so there's no race.
+                const oldCapture = this.systemAudioCapture;
+                oldCapture?.destroy();
+                this.systemAudioCapture = null;
+                this._sysSttRateApplied = false;
+                const fresh = new SystemAudioCapture_1.SystemAudioCapture(this._lastRequestedOutputDeviceId);
+                this.systemAudioCapture = fresh;
+                this.wireSystemCapture(fresh, '(Recovery)');
+                fresh.start();
+                this._systemAudioSuccessfulRestarts++;
+                this._systemAudioConsecutiveFailures = 0;
+                console.log(`[AudioRecovery] SystemAudioCapture recreated successfully (total restarts: ${this._systemAudioSuccessfulRestarts}).`);
+            }
+            catch (recoveryErr) {
+                console.error(`[AudioRecovery] Recovery attempt #${this._systemAudioRecoveryAttempts} failed:`, recoveryErr);
+                // If we've exhausted recovery, tell the renderer the failure is now terminal
+                // for this meeting so it can stop showing "reconnecting" and surface a
+                // mic-only banner instead.
+                if (this._systemAudioRecoveryAttempts >= 3) {
+                    this.broadcast('audio-capture-failed', {
+                        channel: 'system',
+                        message: `System audio capture gave up after 3 attempts. Last error: ${recoveryErr?.message || err.message}`,
+                        attempt: this._systemAudioRecoveryAttempts,
+                        maxAttempts: 3,
+                        terminal: true,
+                    });
+                }
+            }
+            finally {
+                this._systemAudioRecoveryInProgress = false;
+            }
+        });
+    }
+    /**
+     * Default-output-device watcher.
+     *
+     * macOS CoreAudio Tap is per-device — it captures audio from one specific
+     * output device. When SystemAudioCapture is created with no device id (the
+     * common case), the Rust side binds the tap to whatever the system default
+     * output WAS at meeting start. If the user later changes their default
+     * output (plugs in headphones, switches AirPods, routes to a virtual cable),
+     * the tap stays bound to the original device and captures silence — the
+     * interviewer transcript suddenly stops with no obvious cause.
+     *
+     * Production-grade fix: poll the platform default output id every few
+     * seconds while a meeting is active. When the id changes, recreate the
+     * SystemAudioCapture so the tap follows the new route. This only runs when
+     * we're using the default route (no explicit user-selected output device);
+     * if the user picked a specific device, we honor that choice and don't
+     * second-guess it.
+     *
+     * Cost: one napi call (CoreAudio HAL property read) every 4s — negligible.
+     */
+    _defaultOutputWatcherInterval = null;
+    _lastObservedDefaultOutputId = null;
+    _defaultOutputSwitchInProgress = false;
+    startDefaultOutputWatcher() {
+        if (this._defaultOutputWatcherInterval)
+            return; // already running
+        const NativeModule = (0, nativeModuleLoader_1.loadNativeModule)();
+        if (!NativeModule || typeof NativeModule.getDefaultOutputDeviceId !== 'function') {
+            // Older binary without the export — silently skip; the rest of the
+            // pipeline still works, just without auto-recovery on route changes.
+            console.log('[DefaultOutputWatcher] Native getDefaultOutputDeviceId unavailable — skipping route-change watcher.');
+            return;
+        }
+        try {
+            this._lastObservedDefaultOutputId = NativeModule.getDefaultOutputDeviceId() || '';
+        }
+        catch {
+            this._lastObservedDefaultOutputId = '';
+        }
+        console.log(`[DefaultOutputWatcher] Started. Initial default output: ${this._lastObservedDefaultOutputId || '(none)'}`);
+        this._defaultOutputWatcherInterval = setInterval(() => {
+            if (!this.isMeetingActive)
+                return;
+            // Only watch when we're on the default route. If the user explicitly
+            // picked an output device, respect that choice.
+            if (this._lastRequestedOutputDeviceId)
+                return;
+            if (this._defaultOutputSwitchInProgress)
+                return;
+            if (!this.systemAudioCapture)
+                return;
+            let currentId = '';
+            try {
+                currentId = NativeModule.getDefaultOutputDeviceId() || '';
+            }
+            catch (err) {
+                // CoreAudio momentarily unavailable during route change — skip this tick.
+                return;
+            }
+            if (!currentId)
+                return;
+            if (currentId === this._lastObservedDefaultOutputId)
+                return;
+            console.warn(`[DefaultOutputWatcher] Default output changed: ${this._lastObservedDefaultOutputId} → ${currentId}. Rebinding CoreAudio Tap.`);
+            this._lastObservedDefaultOutputId = currentId;
+            this.handleDefaultOutputChanged().catch(err => {
+                console.error('[DefaultOutputWatcher] Failed to rebind tap:', err);
+            });
+        }, 4000);
+    }
+    stopDefaultOutputWatcher() {
+        if (this._defaultOutputWatcherInterval) {
+            clearInterval(this._defaultOutputWatcherInterval);
+            this._defaultOutputWatcherInterval = null;
+        }
+        this._lastObservedDefaultOutputId = null;
+    }
+    async handleDefaultOutputChanged() {
+        if (this._defaultOutputSwitchInProgress)
+            return;
+        this._defaultOutputSwitchInProgress = true;
+        try {
+            // Same destroy+recreate pattern as setupAudioRecoveryHandler — never
+            // stop+start, since the deferred native teardown races the synchronous
+            // start. Reset the recovery counter so a subsequent unrelated failure
+            // gets its full 3-attempt budget.
+            const oldCapture = this.systemAudioCapture;
+            oldCapture?.destroy();
+            this.systemAudioCapture = null;
+            this._sysSttRateApplied = false;
+            this._systemAudioRecoveryAttempts = 0;
+            this._systemAudioConsecutiveFailures = 0;
+            // Pass undefined (not the new device id) so CoreAudio picks up the new
+            // default at construction time. This is intentional: binding to a
+            // stable id would defeat the whole point of "follow the user's route".
+            const fresh = new SystemAudioCapture_1.SystemAudioCapture(undefined);
+            this.systemAudioCapture = fresh;
+            this.wireSystemCapture(fresh, '(RouteChanged)');
+            fresh.start();
+            // Tell the renderer what's happening so any "interviewer went silent"
+            // banners can clear once chunks resume.
+            this.broadcastDeviceSelection({
+                kind: 'output',
+                requested: null,
+                actual: 'default',
+                fellBack: false,
+                reason: 'output-route-changed',
+            });
+            console.log('[DefaultOutputWatcher] CoreAudio Tap rebound to new default output.');
+        }
+        finally {
+            this._defaultOutputSwitchInProgress = false;
+        }
+    }
+    // Mic-side equivalent of setupAudioRecoveryHandler. Pre-fix the cpal err_fn
+    // (USB unplug, device-format change, exclusive-mode steal) only logged to
+    // stderr — JS never learned the mic stream had stopped producing samples
+    // and the user's voice silently disappeared from the transcript.
+    _micRecoveryInProgress = false;
+    _micRecoveryAttempts = 0;
+    _micRecoveryTimer = null;
+    /** Last input device id passed to reconfigureAudio; used by mic recovery. */
+    _lastRequestedInputDeviceId = undefined;
+    setupMicRecoveryHandler() {
+        if (!this.microphoneCapture)
+            return;
+        this.microphoneCapture.on('error', async (err) => {
+            if (!this.isMeetingActive)
+                return;
+            if (this._micRecoveryInProgress || this._micRecoveryAttempts >= 3) {
+                console.warn(`[MicRecovery] Skipping recovery — already in progress or max attempts (${this._micRecoveryAttempts}/3) reached.`);
+                return;
+            }
+            this._micRecoveryInProgress = true;
+            this._micRecoveryAttempts++;
+            console.warn(`[MicRecovery] MicrophoneCapture error — attempting recovery #${this._micRecoveryAttempts}: ${err.message}`);
+            try {
+                await new Promise(resolve => {
+                    this._micRecoveryTimer = setTimeout(resolve, 1500);
+                });
+                this._micRecoveryTimer = null;
+                // Tear down + recreate the mic only (don't touch the system-audio
+                // capture; cpal needs a fresh device handle after error).
+                if (this.microphoneCapture) {
+                    this.microphoneCapture.destroy();
+                    this.microphoneCapture = null;
+                }
+                this._micSttRateApplied = false;
+                try {
+                    this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture(this._lastRequestedInputDeviceId);
+                }
+                catch (createErr) {
+                    console.warn('[MicRecovery] Saved device unavailable on recovery, falling back to default.', createErr);
+                    this.microphoneCapture = new MicrophoneCapture_1.MicrophoneCapture();
+                }
+                // Re-wire the listeners that reconfigureAudio normally sets up.
+                this.microphoneCapture.on('data', (chunk) => {
+                    if (!this._micSttRateApplied && this.googleSTT_User && this.microphoneCapture) {
+                        const r = this.microphoneCapture.getSampleRate();
+                        this.googleSTT_User.setSampleRate(r);
+                        this.googleSTT_User.setAudioChannelCount?.(1);
+                        this._micSttRateApplied = true;
+                    }
+                    this.googleSTT_User?.write(chunk);
+                });
+                this.microphoneCapture.on('sample_rate_changed', (rate) => {
+                    this.googleSTT_User?.setSampleRate(rate);
+                });
+                this.microphoneCapture.on('speech_ended', () => {
+                    this.googleSTT_User?.notifySpeechEnded?.();
+                });
+                this.setupMicRecoveryHandler(); // re-attach on the new instance
+                this.microphoneCapture.start();
+                this._micRecoveryAttempts = 0;
+                console.log('[MicRecovery] MicrophoneCapture restarted successfully.');
+            }
+            catch (recoveryErr) {
+                console.error(`[MicRecovery] Recovery attempt #${this._micRecoveryAttempts} failed:`, recoveryErr);
+            }
+            finally {
+                this._micRecoveryInProgress = false;
+            }
+        });
+    }
+    async startAudioTest(deviceId) {
+        // P2-12: guard against two concurrent calls both passing the async permission check
+        // before either has created a capture — the second call would orphan the first capture.
+        if (this._audioTestStarting)
+            return;
+        // Block audio test while a meeting is live. Both code paths construct
+        // their own MicrophoneCapture instance against the same device; on Windows
+        // cpal grants exclusive access, so the second open silently degrades, and
+        // on macOS the meeting's capture and the test capture compete for the
+        // same input handle — symptom: meeting transcript stalls until the test
+        // is closed. Reject the request loudly via the IPC error path so the
+        // renderer can disable the Test button instead of letting the user think
+        // their mic is broken.
+        if (this.isMeetingActive) {
+            throw new Error('Audio test is unavailable while a meeting is active. End the meeting first, then test your microphone.');
+        }
+        this._audioTestStarting = true;
+        try {
+            await this._startAudioTestImpl(deviceId);
+        }
+        finally {
+            this._audioTestStarting = false;
+        }
+    }
+    async _startAudioTestImpl(deviceId) {
+        console.log(`[Main] Starting Audio Test on device: ${deviceId || 'default'}`);
+        this.stopAudioTest(); // Stop any existing test
+        if (!(await ensureMacMicrophoneAccess('audio test'))) {
+            throw new Error(formatPermissionMessage('mic-denied'));
+        }
+        const attachAudioTestListeners = (capture) => {
+            capture.on('data', (chunk) => {
+                const targets = [
+                    this.settingsWindowHelper.getSettingsWindow(),
+                    this.getWindowHelper().getLauncherWindow(),
+                    this.getWindowHelper().getOverlayWindow(),
+                ].filter((win) => !!win && !win.isDestroyed());
+                if (targets.length === 0)
+                    return;
+                let sum = 0;
+                const step = 10;
+                const len = chunk.length;
+                for (let i = 0; i < len; i += 2 * step) {
+                    const val = chunk.readInt16LE(i);
+                    sum += val * val;
+                }
+                const count = len / (2 * step);
+                if (count > 0) {
+                    const rms = Math.sqrt(sum / count);
+                    const level = Math.min(rms / 10000, 1.0);
+                    for (const target of targets) {
+                        target.webContents.send('audio-test-level', level);
+                    }
+                }
+            });
+            capture.on('error', (err) => {
+                console.error('[Main] AudioTest Error:', err);
+            });
+        };
+        try {
+            this.audioTestCapture = new MicrophoneCapture_1.MicrophoneCapture(deviceId || undefined);
+            attachAudioTestListeners(this.audioTestCapture);
+            this.audioTestCapture.start();
+        }
+        catch (err) {
+            console.warn('[Main] Failed to start audio test on preferred device. Falling back to default.', err);
+            // RC-02 fix: explicitly stop and null the failed capture before creating
+            // the fallback to prevent a brief double-microphone-capture window.
+            try {
+                this.audioTestCapture?.stop();
+            }
+            catch { /* ignore errors on already-failed capture */ }
+            this.audioTestCapture = null;
+            try {
+                this.audioTestCapture = new MicrophoneCapture_1.MicrophoneCapture();
+                attachAudioTestListeners(this.audioTestCapture);
+                this.audioTestCapture.start();
+            }
+            catch (fallbackErr) {
+                console.error('[Main] Failed to start audio test:', fallbackErr);
+                throw fallbackErr;
+            }
+        }
+    }
+    stopAudioTest() {
+        if (this.audioTestCapture) {
+            console.log('[Main] Stopping Audio Test');
+            this.audioTestCapture.stop();
+            this.audioTestCapture = null;
+        }
+    }
+    finalizeMicSTT() {
+        // We only want to finalize the user microphone, because the context is Manual Answer
+        if (this.googleSTT_User?.finalize) {
+            console.log('[Main] Finalizing STT');
+            this.googleSTT_User.finalize();
+        }
+    }
+    async startMeeting(metadata) {
+        console.log('[Main] Starting Meeting...', metadata);
+        // If a previous endMeeting() is still draining STT in the background, wait
+        // for it to finish before we boot a new session — otherwise the BG teardown
+        // could call STT.stop() on instances the new meeting just started using.
+        // In the common case (Stop, then Start seconds later) this awaits an
+        // already-resolved promise and is free.
+        if (this._pendingTeardown) {
+            try {
+                await this._pendingTeardown;
+            }
+            catch {
+                // teardown already logs; safe to swallow here
+            }
+            this._pendingTeardown = null;
+        }
+        // PR #173: Reset audio recovery state for fresh session
+        this._systemAudioRecoveryInProgress = false;
+        this._systemAudioRecoveryAttempts = 0;
+        this._systemAudioConsecutiveFailures = 0;
+        if (this._systemAudioRecoveryTimer) {
+            clearTimeout(this._systemAudioRecoveryTimer);
+            this._systemAudioRecoveryTimer = null;
+        }
+        if (!(await ensureMacMicrophoneAccess('meeting start'))) {
+            const message = formatPermissionMessage('mic-denied');
+            this.broadcast('meeting-audio-error', message);
+            throw new Error(message);
+        }
+        // Check Screen Recording permission required for system audio capture
+        // (CoreAudio Global Process Tap + ScreenCaptureKit both need this).
+        // NOTE: The 'not-determined' TCC dialog is triggered once at app startup
+        // (in initializeApp) so it never pops up mid-meeting here. We only act on
+        // explicit 'denied' — in that case warn the user but let the meeting continue
+        // with microphone-only transcription.
+        if (process.platform === 'darwin') {
+            const screenStatus = getMacScreenCaptureStatus();
+            console.log(`[Main] macOS screen recording permission status: ${screenStatus}`);
+            if (screenStatus === 'denied') {
+                // Permission was explicitly denied — warn the user via the UI but do NOT
+                // auto-open System Settings. Forcing that window open every meeting start
+                // is extremely disruptive, especially when mic transcription is still working.
+                // The UI will show a non-blocking banner; the user can fix it deliberately.
+                const message = formatPermissionMessage('screen-recording-denied');
+                console.warn('[Main]', message);
+                this.broadcast('system-audio-permission-denied', message);
+                // NOTE: Do NOT call shell.openExternal() here — it hijacks focus on every meeting
+                // start. The UI banner (system-audio-permission-denied IPC event) handles this.
+            }
+            // 'not-determined': Handled at startup. SCK/CoreAudio will trigger the TCC
+            // dialog itself when it first attempts to access screen content.
+        }
+        // Reset overlay position BEFORE the switch so the new meeting starts in
+        // a predictable centered position regardless of where the previous
+        // session left it. (Moved up from below so setWindowMode('overlay') reads
+        // the reset bounds.)
+        this.windowHelper.resetOverlayPosition();
+        // ─── WINDOW SWAP BEFORE STATE BROADCAST ───────────────────────────────
+        // Switch to the overlay BEFORE flipping `isMeetingActive` to true. If we
+        // broadcast meeting-state-changed:{isActive:true} while the launcher is
+        // still visible, the launcher's CTA pill briefly crossfades blue→green
+        // before the renderer's follow-up setWindowMode('overlay') hides it —
+        // visible as a flash. Switching first means the launcher hides before
+        // the state event arrives, so the user only ever sees the overlay.
+        this.windowHelper.setWindowMode('overlay');
+        this.isMeetingActive = true;
+        this.broadcastMeetingState();
+        if (metadata) {
+            this.intelligenceManager.setMeetingMetadata(metadata);
+        }
+        // Phase 3 — bind dynamic action engine to this meeting + active mode.
+        // Action store is per-(sessionId, modeId), so a fresh sessionId here gives
+        // us per-meeting isolation. Re-binding on mode switch is handled in the
+        // modes:set-active IPC handler.
+        let _meetingTelemetrySessionId;
+        try {
+            const { ModesManager } = require('./services/ModesManager');
+            const activeMode = ModesManager.getInstance().getActiveMode();
+            if (activeMode) {
+                const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                _meetingTelemetrySessionId = sessionId;
+                this.intelligenceManager.setDynamicActionContext({
+                    sessionId,
+                    modeId: activeMode.id,
+                    modeTemplateType: activeMode.templateType,
+                });
+            }
+        }
+        catch (err) {
+            // Auxiliary feature — never block meeting start.
+            console.warn('[Main] failed to bind dynamic action context at meeting start:', err?.message);
+        }
+        // Phase 6 — meeting_start telemetry (no transcript / no PII).
+        try {
+            const { telemetryService } = require('./services/telemetry/TelemetryService');
+            const { ModesManager } = require('./services/ModesManager');
+            const am = ModesManager.getInstance().getActiveMode();
+            telemetryService.track({
+                name: 'meeting_start',
+                sessionId: _meetingTelemetrySessionId,
+                modeId: am?.id,
+                properties: { modeTemplateType: am?.templateType, hasMetadata: Boolean(metadata) },
+            });
+        }
+        catch { /* non-fatal */ }
+        // Emit session reset to clear UI state immediately
+        this.getWindowHelper().getOverlayWindow()?.webContents.send('session-reset');
+        this.getWindowHelper().getLauncherWindow()?.webContents.send('session-reset');
+        // ★ ASYNC AUDIO INIT: Return INSTANTLY so the IPC response goes back
+        // to the renderer immediately, allowing the UI to switch to overlay
+        // without waiting for SCK/audio initialization (which takes 5-7 seconds).
+        // setTimeout(0) ensures setWindowMode IPC is processed first.
+        setTimeout(async () => {
+            // BUG-02 fix: a fast start→stop sequence can call endMeeting() before
+            // this callback fires, leaving isMeetingActive=false. If that happened,
+            // do NOT boot the audio pipeline — it would run forever with no stop signal.
+            if (!this.isMeetingActive) {
+                console.warn('[Main] Meeting was cancelled before audio pipeline could start — aborting init.');
+                return;
+            }
+            try {
+                // Check for audio configuration preference
+                if (metadata?.audio) {
+                    await this.reconfigureAudio(metadata.audio.inputDeviceId, metadata.audio.outputDeviceId);
+                }
+                // LAZY INIT: Ensure pipeline is ready (if not reconfigured above)
+                this.setupSystemAudioPipeline();
+                // Start System Audio
+                this.systemAudioCapture?.start();
+                this.googleSTT?.start();
+                // Start Microphone
+                this.microphoneCapture?.start();
+                this.googleSTT_User?.start();
+                // Start JIT RAG live indexing
+                if (this.ragManager) {
+                    this.ragManager.startLiveIndexing('live-meeting-current');
+                }
+                // Watch for default-output route changes so the CoreAudio Tap follows
+                // the user when they swap output devices mid-meeting (AirPods plug,
+                // headphones, virtual cable). No-op if the user picked a specific
+                // output or if the native binary lacks the getDefaultOutputDeviceId
+                // export.
+                this.startDefaultOutputWatcher();
+                if (this._verboseLogging) {
+                    const requestedInput = metadata?.audio?.inputDeviceId || 'default';
+                    const requestedOutput = metadata?.audio?.outputDeviceId || 'default';
+                    const backend = requestedOutput === 'sck' ? 'sck' : 'coreaudio';
+                    const sysRate = this.systemAudioCapture?.getSampleRate() || 48000;
+                    const micRate = this.microphoneCapture?.getSampleRate() || 48000;
+                    console.log(`[Main][debug] Audio pipeline: input=${requestedInput} output=${requestedOutput} backend=${backend} sysRate=${sysRate}Hz micRate=${micRate}Hz`);
+                }
+                console.log('[Main] Audio pipeline started successfully.');
+            }
+            catch (err) {
+                console.error('[Main] Error initializing audio pipeline:', err);
+                // Notify UI so user knows microphone/audio failed to start
+                this.broadcast('meeting-audio-error', err.message || 'Audio pipeline failed to start');
+            }
+        }, 0); // Defer to next event loop tick — ensures IPC response reaches renderer before audio init
+    }
+    async endMeeting() {
+        console.log('[Main] Ending Meeting...');
+        // Phase 6 — meeting_stop telemetry. Emit BEFORE any teardown so a crash
+        // in stop logic still records the stop event.
+        try {
+            const { telemetryService } = require('./services/telemetry/TelemetryService');
+            const { ModesManager } = require('./services/ModesManager');
+            const am = ModesManager.getInstance().getActiveMode();
+            telemetryService.track({
+                name: 'meeting_stop',
+                modeId: am?.id,
+                properties: { modeTemplateType: am?.templateType },
+            });
+        }
+        catch { /* non-fatal */ }
+        // Reset Mouse Passthrough so the next meeting overlay starts fresh and focusable
+        if (this.overlayMousePassthrough) {
+            this.setOverlayMousePassthrough(false);
+        }
+        // ─── UX STATE FLIP — SYNCHRONOUS ───────────────────────────────────────
+        // Flip the UX-facing meeting flag to false RIGHT NOW and broadcast. The
+        // launcher's "Meeting ongoing" pill subscribes to meeting-state-changed,
+        // so this guarantees the pill reverts to "Start Natively" the moment the
+        // user clicks Stop — no green→blue flash if they click Start again before
+        // the 250 ms STT drain finishes. The transcript handler keys off
+        // `_isDraining` instead so trailing finals are still accepted.
+        this.isMeetingActive = false;
+        this._isDraining = true;
+        this.broadcastMeetingState();
+        // ─── WINDOW SWAP ───────────────────────────────────────────────────────
+        // Swap to the launcher BEFORE any audio teardown. The native monitor.stop()
+        // calls below are scheduled via setImmediate; libuv runs setImmediate
+        // callbacks on the very next tick AFTER this handler returns and BEFORE
+        // the next IPC message is processed. So if we did the window swap after
+        // (or relied on a follow-up setWindowMode IPC), the user would stare at
+        // the frozen overlay for 100–600 ms while the DSP/CoreAudio Tap/SCK
+        // threads joined. Calling switchToLauncher() here gets the show/hide
+        // commands to the OS compositor before the main thread blocks.
+        this.windowHelper.setWindowMode('launcher');
+        // ─── SYNCHRONOUS: things the user expects "right now" on Stop click ────
+        // Captures are deferred-stop wrappers (see SystemAudioCapture.stop /
+        // MicrophoneCapture.stop) — they flip the JS-side isRecording flag
+        // immediately so no new audio reaches STT, but defer the blocking native
+        // teardown to setImmediate. Returns within ~1ms.
+        this.systemAudioCapture?.stop();
+        this.microphoneCapture?.stop();
+        // Stop the default-output watcher — no point polling CoreAudio while
+        // there's no active capture to rebind.
+        this.stopDefaultOutputWatcher();
+        // Tell STT to mark the audio stream as ended; trailing finals will arrive
+        // over the next ~150ms while we're already returning to the renderer.
+        this.googleSTT?.finalize?.();
+        this.googleSTT_User?.finalize?.();
+        // ─── BACKGROUND: STT drain + meeting save + RAG embed ────────────────
+        // Note: `isMeetingActive` was already flipped to false synchronously above
+        // (so the launcher UI updates instantly). `_isDraining` is true during the
+        // 250 ms grace window so the transcript handler keeps accepting trailing
+        // finals — without that, the user's last sentence vanishes. We expose the
+        // in-flight teardown as `_pendingTeardown` so a fast start→stop→start
+        // sequence awaits this completion in startMeeting() before booting a new
+        // session on the (still-shared) STT instances.
+        const ragManager = this.ragManager;
+        this._pendingTeardown = (async () => {
+            try {
+                // 0. Revert to Default Model. Moved into BG: getDefaultModel() and the
+                //    provider list reads touch disk, and the 'model-changed' broadcast
+                //    re-renders all open windows — both block the main thread/renderer
+                //    during the Stop-click critical path. Doing it here means the
+                //    revert lands ~250 ms after Stop, by which point the launcher is
+                //    already painted and the overlay is hidden, so the user never
+                //    sees a stutter.
+                try {
+                    const { CredentialsManager } = require('./services/CredentialsManager');
+                    const cm = CredentialsManager.getInstance();
+                    const defaultModel = cm.getDefaultModel();
+                    const all = [...(cm.getCurlProviders() || []), ...(cm.getCustomProviders() || [])];
+                    console.log(`[Main] Reverting model to default: ${defaultModel}`);
+                    this.processingHelper.getLLMHelper().setModel(defaultModel, all);
+                    electron_1.BrowserWindow.getAllWindows().forEach(win => {
+                        if (!win.isDestroyed())
+                            win.webContents.send('model-changed', defaultModel);
+                    });
+                }
+                catch (e) {
+                    console.error('[Main] Failed to revert model:', e);
+                }
+                // 1. Grace window for STT trailing finals (Google/Soniox/Deepgram all
+                //    reply to finalize() within 100–200ms). 250ms is conservative.
+                await new Promise(resolve => setTimeout(resolve, 250));
+                // 2. Tear down STT sockets now that finals have arrived.
+                this.googleSTT?.stop();
+                this.googleSTT_User?.stop();
+                // 3. Snapshot transcript + persist placeholder + queue title/summary LLM.
+                //    intelligenceManager.stopMeeting itself runs LLM in background.
+                const meetingId = await this.intelligenceManager.stopMeeting();
+                // 5. RAG cleanup — same logic as before, just inside the BG IIFE.
+                if (meetingId) {
+                    if (ragManager) {
+                        await ragManager.stopLiveIndexing();
+                        console.log('[Main] Live RAG indexing stopped.');
+                    }
+                    await this.processCompletedMeetingForRAG(meetingId);
+                    if (ragManager && !this.isMeetingActive) {
+                        ragManager.deleteMeetingData('live-meeting-current');
+                        console.log('[Main] JIT RAG provisional chunks cleaned up.');
+                    }
+                    else if (this.isMeetingActive) {
+                        console.log('[Main] New meeting started during cleanup — skipping live-meeting-current deletion.');
+                    }
+                }
+                else {
+                    if (ragManager) {
+                        await ragManager.stopLiveIndexing().catch(() => { });
+                        if (!this.isMeetingActive)
+                            ragManager.deleteMeetingData('live-meeting-current');
+                    }
+                }
+            }
+            catch (err) {
+                console.error('[Main] Background meeting teardown failed:', err);
+            }
+            finally {
+                this._isDraining = false;
+            }
+        })();
+        // endMeeting returns NOW — the IPC handler resolves and the renderer's
+        // "Stop" button transitions instantly. Total endMeeting wall-clock time
+        // is now bounded by the synchronous block above (~1–5ms typical).
+    }
+    async processCompletedMeetingForRAG(meetingId) {
+        if (!this.ragManager)
+            return;
+        try {
+            // Use the explicit meetingId passed from endMeeting() — deterministic, never
+            // picks up a concurrently started meeting the way getRecentMeetings(1) could.
+            const meeting = DatabaseManager_1.DatabaseManager.getInstance().getMeetingDetails(meetingId);
+            if (!meeting || !meeting.transcript || meeting.transcript.length === 0)
+                return;
+            // Convert transcript to RAG format
+            const segments = meeting.transcript.map(t => ({
+                speaker: t.speaker,
+                text: t.text,
+                timestamp: t.timestamp
+            }));
+            // Generate summary from detailedSummary if available
+            let summary;
+            if (meeting.detailedSummary) {
+                summary = [
+                    ...(meeting.detailedSummary.keyPoints || []),
+                    ...(meeting.detailedSummary.actionItems || []).map(a => `Action: ${a}`)
+                ].join('. ');
+            }
+            const result = await this.ragManager.processMeeting(meeting.id, segments, summary);
+            console.log(`[AppState] RAG processed meeting ${meeting.id}: ${result.chunkCount} chunks`);
+        }
+        catch (error) {
+            console.error('[AppState] Failed to process meeting for RAG:', error);
+        }
+    }
+    setupIntelligenceEvents() {
+        const mainWindow = this.getMainWindow.bind(this);
+        const tokenBatches = new Map();
+        let batchFlushScheduled = false;
+        const flushBatchesNow = () => {
+            const win = mainWindow();
+            if (!win) {
+                tokenBatches.clear();
+                return;
+            }
+            for (const [kind, items] of tokenBatches.entries()) {
+                if (items.length > 0) {
+                    win.webContents.send('intelligence-token-batch', { kind, items });
+                }
+            }
+            tokenBatches.clear();
+        };
+        const scheduleBatchFlush = () => {
+            if (batchFlushScheduled)
+                return;
+            batchFlushScheduled = true;
+            setImmediate(() => {
+                batchFlushScheduled = false;
+                flushBatchesNow();
+            });
+        };
+        const queueBatch = (kind, item) => {
+            let arr = tokenBatches.get(kind);
+            if (!arr) {
+                arr = [];
+                tokenBatches.set(kind, arr);
+            }
+            arr.push(item);
+            scheduleBatchFlush();
+        };
+        // ORDER: every final-answer handler must call this BEFORE its own send so
+        // the renderer sees (..., last tokens, final answer) and not (..., final
+        // answer, trailing tokens) — the latter would clobber the just-finalized
+        // row with appended text from a pending setImmediate batch.
+        const flushBatchesBeforeFinal = flushBatchesNow;
+        // Forward intelligence events to renderer
+        this.intelligenceManager.on('assist_update', (insight) => {
+            // Send to both if both exist, though mostly overlay needs it
+            const helper = this.getWindowHelper();
+            helper.getLauncherWindow()?.webContents.send('intelligence-assist-update', { insight });
+            helper.getOverlayWindow()?.webContents.send('intelligence-assist-update', { insight });
+        });
+        // Phase 3 — Cluely-style dynamic action card. Forward to all open windows
+        // (launcher + overlay) so whichever surface the user has up shows the card.
+        this.intelligenceManager.on('dynamic_action_emitted', (action) => {
+            const helper = this.getWindowHelper();
+            helper.getLauncherWindow()?.webContents.send('intelligence-dynamic-action', { action });
+            helper.getOverlayWindow()?.webContents.send('intelligence-dynamic-action', { action });
+            // Phase 6 — telemetry: log detection (sanitized: NO transcript text, NO
+            // evidence body — only ids, type, mode, confidence). The TelemetryService
+            // sanitizer also strips transcript-shaped fields defensively.
+            try {
+                const { telemetryService } = require('./services/telemetry/TelemetryService');
+                telemetryService.track({
+                    name: 'dynamic_action_detected',
+                    sessionId: action?.sessionId,
+                    modeId: action?.modeId,
+                    properties: {
+                        actionId: action?.id,
+                        actionType: action?.type,
+                        modeTemplateType: action?.modeTemplateType,
+                        confidence: action?.confidence,
+                        priority: action?.priority,
+                    },
+                });
+            }
+            catch { /* non-fatal */ }
+        });
+        this.intelligenceManager.on('suggested_answer', (answer, question, confidence) => {
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-suggested-answer', { answer, question, confidence });
+            }
+        });
+        this.intelligenceManager.on('suggested_answer_token', (token, question, confidence) => {
+            // Sprint 9: batch instead of per-token webContents.send.
+            queueBatch('suggested_answer', { token, question, confidence });
+        });
+        // Sprint 7: dedicated negotiation-coaching channel. Engine emits this
+        // INSTEAD of suggested_answer / suggested_answer_token when it detects
+        // the coaching sentinel, so the renderer no longer needs JSON.parse-
+        // every-token detection.
+        this.intelligenceManager.on('negotiation_coaching', (payload) => {
+            // Sprint 9: flush any pending batched tokens first so the renderer
+            // sees them before the coaching card swap.
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-negotiation-coaching', { payload });
+            }
+        });
+        this.intelligenceManager.on('refined_answer_token', (token, intent) => {
+            // Sprint 9: batch.
+            queueBatch('refined_answer', { token, intent });
+        });
+        this.intelligenceManager.on('refined_answer', (answer, intent) => {
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-refined-answer', { answer, intent });
+            }
+        });
+        this.intelligenceManager.on('recap', (summary) => {
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-recap', { summary });
+            }
+        });
+        this.intelligenceManager.on('recap_token', (token) => {
+            // Sprint 9: batch.
+            queueBatch('recap', { token });
+        });
+        this.intelligenceManager.on('clarify', (clarification) => {
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-clarify', { clarification });
+            }
+        });
+        this.intelligenceManager.on('clarify_token', (token) => {
+            // Sprint 9: batch.
+            queueBatch('clarify', { token });
+        });
+        this.intelligenceManager.on('follow_up_questions_update', (questions) => {
+            flushBatchesBeforeFinal();
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-follow-up-questions-update', { questions });
+            }
+        });
+        this.intelligenceManager.on('follow_up_questions_token', (token) => {
+            // Sprint 9: batch.
+            queueBatch('follow_up_questions', { token });
+        });
+        this.intelligenceManager.on('manual_answer_started', () => {
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-manual-started');
+            }
+        });
+        this.intelligenceManager.on('manual_answer_result', (answer, question) => {
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-manual-result', { answer, question });
+            }
+        });
+        this.intelligenceManager.on('mode_changed', (mode) => {
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-mode-changed', { mode });
+            }
+        });
+        this.intelligenceManager.on('error', (error, mode) => {
+            console.error(`[IntelligenceManager] Error in ${mode}:`, error);
+            const win = mainWindow();
+            if (win) {
+                win.webContents.send('intelligence-error', { error: error.message, mode });
+            }
+        });
+    }
+    updateGoogleCredentials(keyPath) {
+        console.log(`[AppState] Updating Google Credentials to: ${keyPath}`);
+        // Set global environment variable so new instances pick it up
+        process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
+        if (this.googleSTT) {
+            this.googleSTT.setCredentials(keyPath);
+        }
+        if (this.googleSTT_User) {
+            this.googleSTT_User.setCredentials(keyPath);
+        }
+    }
+    setRecognitionLanguage(key) {
+        console.log(`[AppState] Setting recognition language to: ${key}`);
+        const { CredentialsManager } = require('./services/CredentialsManager');
+        CredentialsManager.getInstance().setSttLanguage(key);
+        // 'auto' is only meaningful for NativelyProSTT — other providers fall back to en-US.
+        const sttProvider = CredentialsManager.getInstance().getSttProvider();
+        const effectiveKey = (key === 'auto' && sttProvider !== 'natively') ? 'english-us' : key;
+        this.googleSTT?.setRecognitionLanguage(effectiveKey);
+        this.googleSTT_User?.setRecognitionLanguage(effectiveKey);
+        this.processingHelper.getLLMHelper().setSttLanguage(effectiveKey);
+    }
+    static getInstance() {
+        if (!AppState.instance) {
+            AppState.instance = new AppState();
+        }
+        return AppState.instance;
+    }
+    // Getters and Setters
+    getMainWindow() {
+        return this.windowHelper.getMainWindow();
+    }
+    getWindowHelper() {
+        return this.windowHelper;
+    }
+    getIntelligenceManager() {
+        return this.intelligenceManager;
+    }
+    getThemeManager() {
+        return this.themeManager;
+    }
+    getRAGManager() {
+        return this.ragManager;
+    }
+    getKnowledgeOrchestrator() {
+        return this.knowledgeOrchestrator;
+    }
+    getView() {
+        return this.view;
+    }
+    setView(view) {
+        this.view = view;
+        this.screenshotHelper.setView(view);
+    }
+    isVisible() {
+        return this.windowHelper.isVisible();
+    }
+    getScreenshotHelper() {
+        return this.screenshotHelper;
+    }
+    getProblemInfo() {
+        return this.problemInfo;
+    }
+    setProblemInfo(problemInfo) {
+        this.problemInfo = problemInfo;
+    }
+    getScreenshotQueue() {
+        return this.screenshotHelper.getScreenshotQueue();
+    }
+    getExtraScreenshotQueue() {
+        return this.screenshotHelper.getExtraScreenshotQueue();
+    }
+    // Window management methods
+    setupOllamaIpcHandlers() {
+        electron_1.ipcMain.handle('get-ollama-models', async () => {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout for detection
+                const response = await fetch('http://localhost:11434/api/tags', {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                if (response.ok) {
+                    const data = await response.json();
+                    // data.models is an array of objects: { name: "llama3:latest", ... }
+                    return data.models.map((m) => m.name);
+                }
+                return [];
+            }
+            catch (error) {
+                // console.warn("Ollama detection failed:", error);
+                return [];
+            }
+        });
+    }
+    createWindow() {
+        this.windowHelper.createWindow();
+    }
+    hideMainWindow() {
+        this.windowHelper.hideMainWindow();
+    }
+    showMainWindow(inactive) {
+        if (this.windowHelper) {
+            this.windowHelper.showMainWindow(inactive);
+        }
+    }
+    toggleMainWindow() {
+        console.log("Screenshots: ", this.screenshotHelper.getScreenshotQueue().length, "Extra screenshots: ", this.screenshotHelper.getExtraScreenshotQueue().length);
+        const mode = this.windowHelper.getCurrentWindowMode();
+        if (mode === 'launcher') {
+            // In launcher mode, just physically hide/show the window
+            this.windowHelper.toggleMainWindow();
+        }
+        else {
+            // In overlay mode, send toggle-expand IPC to expand/collapse the UI
+            const targetWindow = this.windowHelper.getOverlayWindow();
+            if (targetWindow && !targetWindow.isDestroyed()) {
+                targetWindow.webContents.send('toggle-expand');
+            }
+        }
+    }
+    setWindowDimensions(width, height) {
+        this.windowHelper.setWindowDimensions(width, height);
+    }
+    clearQueues() {
+        this.screenshotHelper.clearQueues();
+        // Clear problem info
+        this.problemInfo = null;
+        // Reset view to initial state
+        this.setView("queue");
+    }
+    createScreenshotCaptureSession(captureKind, restoreFocus) {
+        const settingsWindow = this.settingsWindowHelper.getSettingsWindow();
+        const modelSelectorWindow = this.modelSelectorWindowHelper.getWindow();
+        return {
+            captureKind,
+            wasMainWindowVisible: this.windowHelper.isVisible(),
+            windowMode: this.windowHelper.getCurrentWindowMode(),
+            wasSettingsVisible: !!settingsWindow && !settingsWindow.isDestroyed() && settingsWindow.isVisible(),
+            wasModelSelectorVisible: !!modelSelectorWindow && !modelSelectorWindow.isDestroyed() && modelSelectorWindow.isVisible(),
+            overlayBounds: this.windowHelper.getLastOverlayBounds(),
+            overlayDisplayId: this.windowHelper.getLastOverlayDisplayId(),
+            restoreWithoutFocus: process.platform === 'darwin' || !restoreFocus
+        };
+    }
+    getDisplayById(displayId) {
+        if (displayId === null)
+            return undefined;
+        return electron_1.screen.getAllDisplays().find(display => display.id === displayId);
+    }
+    getTargetDisplayForFullScreenshot(session) {
+        if (session.windowMode === 'overlay' && session.overlayBounds) {
+            return electron_1.screen.getDisplayMatching(session.overlayBounds);
+        }
+        const lastOverlayDisplay = this.getDisplayById(session.overlayDisplayId);
+        if (lastOverlayDisplay) {
+            return lastOverlayDisplay;
+        }
+        return electron_1.screen.getDisplayNearestPoint(electron_1.screen.getCursorScreenPoint());
+    }
+    hideWindowsForScreenshot(session) {
+        if (session.wasModelSelectorVisible) {
+            this.modelSelectorWindowHelper.hideWindow();
+        }
+        if (session.wasSettingsVisible) {
+            this.settingsWindowHelper.closeWindow();
+        }
+        if (session.wasMainWindowVisible) {
+            this.hideMainWindow();
+        }
+    }
+    restoreWindowsAfterScreenshot(session) {
+        const activate = !session.restoreWithoutFocus;
+        const shouldRestoreMainWindow = session.wasMainWindowVisible;
+        if (shouldRestoreMainWindow) {
+            if (session.windowMode === 'overlay') {
+                this.windowHelper.switchToOverlay(!activate);
+            }
+            else {
+                this.windowHelper.switchToLauncher(!activate);
+            }
+        }
+        if (session.wasSettingsVisible) {
+            const settingsWindow = this.settingsWindowHelper.getSettingsWindow();
+            if (settingsWindow && !settingsWindow.isDestroyed()) {
+                const { x, y } = settingsWindow.getBounds();
+                this.settingsWindowHelper.showWindow(x, y, { activate });
+            }
+        }
+        if (session.wasModelSelectorVisible) {
+            const modelSelectorWindow = this.modelSelectorWindowHelper.getWindow();
+            if (modelSelectorWindow && !modelSelectorWindow.isDestroyed()) {
+                const { x, y } = modelSelectorWindow.getBounds();
+                this.modelSelectorWindowHelper.showWindow(x, y, { activate });
+            }
+        }
+    }
+    async withScreenshotCaptureSession(captureKind, restoreFocus, capture) {
+        if (!this.getMainWindow()) {
+            throw new Error("No main window available");
+        }
+        if (this.screenshotCaptureInProgress) {
+            throw new Error("Screenshot capture already in progress");
+        }
+        const session = this.createScreenshotCaptureSession(captureKind, restoreFocus);
+        this.screenshotCaptureInProgress = true;
+        try {
+            this.hideWindowsForScreenshot(session);
+            // setOpacity(0) makes the window invisible to the compositor immediately
+            // (within the current frame). hide() removes it from the event dispatch
+            // tree synchronously. One compositor frame flush (~16ms) is enough for
+            // macOS to stop including the window in the next capture frame. We wait
+            // 80ms to give the GPU render server one full v-sync cycle + overhead,
+            // which consistently avoids the black-frame artifact without the
+            // excessive 150ms latency the old value imposed.
+            await new Promise(resolve => setTimeout(resolve, process.platform === 'darwin' ? 80 : 40));
+            return await capture(session);
+        }
+        finally {
+            try {
+                this.restoreWindowsAfterScreenshot(session);
+            }
+            finally {
+                this.screenshotCaptureInProgress = false;
+            }
+        }
+    }
+    // Screenshot management methods
+    async takeScreenshot(restoreFocus = true) {
+        return this.withScreenshotCaptureSession('full', restoreFocus, (session) => this.screenshotHelper.takeScreenshot(this.getTargetDisplayForFullScreenshot(session)));
+    }
+    async takeSelectiveScreenshot(restoreFocus = true) {
+        return this.withScreenshotCaptureSession('selective', restoreFocus, async () => {
+            let captureArea;
+            if (process.platform === 'win32' || process.platform === 'darwin') {
+                captureArea = await this.cropperWindowHelper.showCropper();
+                if (!captureArea) {
+                    throw new Error("Selection cancelled");
+                }
+            }
+            return this.screenshotHelper.takeSelectiveScreenshot(captureArea);
+        });
+    }
+    async getImagePreview(filepath) {
+        return this.screenshotHelper.getImagePreview(filepath);
+    }
+    async deleteScreenshot(path) {
+        return this.screenshotHelper.deleteScreenshot(path);
+    }
+    // New methods to move the window
+    moveWindowLeft() {
+        this.windowHelper.moveWindowLeft();
+    }
+    moveWindowRight() {
+        this.windowHelper.moveWindowRight();
+    }
+    moveWindowDown() {
+        this.windowHelper.moveWindowDown();
+    }
+    moveWindowUp() {
+        this.windowHelper.moveWindowUp();
+    }
+    centerAndShowWindow() {
+        this.windowHelper.centerAndShowWindow();
+    }
+    createTray() {
+        this.showTray();
+    }
+    showTray() {
+        if (this.tray)
+            return;
+        // Try to find a template image first for macOS
+        const resourcesPath = electron_1.app.isPackaged ? process.resourcesPath : electron_1.app.getAppPath();
+        // Potential paths for tray icon
+        const templatePath = path_1.default.join(resourcesPath, 'assets', 'iconTemplate.png');
+        const defaultIconPath = electron_1.app.isPackaged
+            ? path_1.default.join(resourcesPath, 'src/components/icon.png')
+            : path_1.default.join(electron_1.app.getAppPath(), 'src/components/icon.png');
+        let iconToUse = defaultIconPath;
+        // Check if template exists (sync check is fine for startup/rare toggle)
+        try {
+            if (require('fs').existsSync(templatePath)) {
+                iconToUse = templatePath;
+                console.log('[Tray] Using template icon:', templatePath);
+            }
+            else {
+                // Also check src/components for dev
+                const devTemplatePath = path_1.default.join(electron_1.app.getAppPath(), 'src/components/iconTemplate.png');
+                if (require('fs').existsSync(devTemplatePath)) {
+                    iconToUse = devTemplatePath;
+                    console.log('[Tray] Using dev template icon:', devTemplatePath);
+                }
+                else {
+                    console.log('[Tray] Template icon not found, using default:', defaultIconPath);
+                }
+            }
+        }
+        catch (e) {
+            console.error('[Tray] Error checking for icon:', e);
+        }
+        const trayIcon = electron_1.nativeImage.createFromPath(iconToUse).resize({ width: 16, height: 16 });
+        // IMPORTANT: specific template settings for macOS if needed, but 'Template' in name usually suffices
+        trayIcon.setTemplateImage(iconToUse.endsWith('Template.png'));
+        this.tray = new electron_1.Tray(trayIcon);
+        this.tray.setToolTip('Natively'); // This tooltip might also need update if we change global shortcut, but global shortcut is removed.
+        this.updateTrayMenu();
+        // Double-click to show window
+        this.tray.on('double-click', () => {
+            this.centerAndShowWindow();
+        });
+    }
+    updateTrayMenu() {
+        if (!this.tray)
+            return;
+        const keybindManager = KeybindManager_1.KeybindManager.getInstance();
+        const screenshotAccel = keybindManager.getKeybind('general:take-screenshot') || 'CommandOrControl+H';
+        console.log('[Main] updateTrayMenu called. Screenshot Accelerator:', screenshotAccel);
+        // Update tooltip for verification
+        this.tray.setToolTip('Natively');
+        // Helper to format accelerator for display (e.g. CommandOrControl+H -> Cmd+H)
+        const formatAccel = (accel) => {
+            return accel
+                .replace('CommandOrControl', 'Cmd')
+                .replace('Command', 'Cmd')
+                .replace('Control', 'Ctrl')
+                .replace('OrControl', '') // Cleanup just in case
+                .replace(/\+/g, '+');
+        };
+        const displayScreenshot = formatAccel(screenshotAccel);
+        // We can also get the toggle visibility shortcut if desired
+        const toggleKb = keybindManager.getKeybind('general:toggle-visibility');
+        const toggleAccel = toggleKb || 'CommandOrControl+B';
+        const displayToggle = formatAccel(toggleAccel);
+        const contextMenu = electron_1.Menu.buildFromTemplate([
+            {
+                label: 'Show Natively',
+                click: () => {
+                    this.centerAndShowWindow();
+                }
+            },
+            {
+                label: `Toggle Window (${displayToggle})`,
+                click: () => {
+                    this.toggleMainWindow();
+                }
+            },
+            {
+                type: 'separator'
+            },
+            {
+                label: `Take Screenshot (${displayScreenshot})`,
+                accelerator: screenshotAccel,
+                click: async () => {
+                    try {
+                        const screenshotPath = await this.takeScreenshot();
+                        const preview = await this.getImagePreview(screenshotPath);
+                        const mainWindow = this.getMainWindow();
+                        if (mainWindow) {
+                            mainWindow.webContents.send("screenshot-taken", {
+                                path: screenshotPath,
+                                preview
+                            });
+                        }
+                    }
+                    catch (error) {
+                        console.error("Error taking screenshot from tray:", error);
+                    }
+                }
+            },
+            {
+                type: 'separator'
+            },
+            {
+                label: 'Quit',
+                accelerator: 'Command+Q',
+                click: () => {
+                    electron_1.app.quit();
+                }
+            }
+        ]);
+        this.tray.setContextMenu(contextMenu);
+    }
+    hideTray() {
+        if (this.tray) {
+            this.tray.destroy();
+            this.tray = null;
+        }
+    }
+    setHasDebugged(value) {
+        this.hasDebugged = value;
+    }
+    getHasDebugged() {
+        return this.hasDebugged;
+    }
+    setUndetectable(state) {
+        // Guard: skip if state hasn't actually changed to prevent
+        // duplicate dock hide/show cycles from renderer feedback loops
+        if (this.isUndetectable === state)
+            return;
+        console.log(`[Stealth] setUndetectable(${state}) called`);
+        this.isUndetectable = state;
+        this.windowHelper.setContentProtection(state);
+        this.settingsWindowHelper.setContentProtection(state);
+        this.modelSelectorWindowHelper.setContentProtection(state);
+        this.cropperWindowHelper.setContentProtection(state);
+        if (process.platform === 'win32') {
+            this.windowHelper.syncOverlayInteractionPolicy();
+            this.settingsWindowHelper.syncActivationPolicy();
+            this.modelSelectorWindowHelper.syncActivationPolicy();
+        }
+        // Persist state via SettingsManager
+        SettingsManager_1.SettingsManager.getInstance().set('isUndetectable', state);
+        // Cancel all pending disguise timers to prevent their app.setName() calls
+        // from re-registering the dock icon after we hide it
+        if (state) {
+            for (const timer of this._disguiseTimers) {
+                clearTimeout(timer);
+            }
+            this._disguiseTimers = [];
+        }
+        // Broadcast state change to all relevant windows
+        this._broadcastToAllWindows('undetectable-changed', state);
+        // --- STEALTH MODE LOGIC ---
+        // The dock hide/show is debounced: rapid toggles update isUndetectable immediately
+        // (so content protection, IPC broadcasts and the guard above are always current),
+        // but the actual macOS dock/tray/focus operation only fires once the user stops
+        // toggling. This eliminates the race where dock.show() + NSApp.activate() lingers
+        // after a subsequent dock.hide() call.
+        if (process.platform === 'darwin') {
+            if (this._dockDebounceTimer) {
+                clearTimeout(this._dockDebounceTimer);
+                this._dockDebounceTimer = null;
+            }
+            this._dockDebounceTimer = setTimeout(() => {
+                this._dockDebounceTimer = null;
+                // Read the settled state — may differ from the `state` captured above
+                // if the user toggled again before the timer fired.
+                const settled = this.isUndetectable;
+                const activeWindow = this.windowHelper.getMainWindow();
+                const settingsWindow = this.settingsWindowHelper.getSettingsWindow();
+                let targetFocusWindow = activeWindow;
+                if (settingsWindow && !settingsWindow.isDestroyed() && settingsWindow.isVisible()) {
+                    targetFocusWindow = settingsWindow;
+                }
+                const modelSelectorWindow = this.modelSelectorWindowHelper.getWindow();
+                const isModelSelectorVisible = modelSelectorWindow && !modelSelectorWindow.isDestroyed() && modelSelectorWindow.isVisible();
+                if (targetFocusWindow && targetFocusWindow === settingsWindow) {
+                    this.settingsWindowHelper.setIgnoreBlur(true);
+                }
+                if (isModelSelectorVisible) {
+                    this.modelSelectorWindowHelper.setIgnoreBlur(true);
+                }
+                if (settled) {
+                    // Capture whether Natively is currently the frontmost app BEFORE
+                    // dock.hide() — that call triggers an implicit macOS app-deactivation
+                    // which shifts keyboard focus to the next frontmost app (Chrome, etc.).
+                    const nativelyWasFocused = targetFocusWindow != null &&
+                        !targetFocusWindow.isDestroyed() &&
+                        targetFocusWindow.isFocused();
+                    console.log('[Stealth] Calling app.dock.hide()');
+                    electron_1.app.dock.hide();
+                    this.hideTray();
+                    // If Natively was the focused window when the user toggled stealth,
+                    // restore focus to our window after dock.hide() so macOS does not
+                    // hand control to Chrome / whatever is behind us.
+                    // We use win.focus() (not app.focus()) to avoid the heavy-handed
+                    // [NSApp activateIgnoringOtherApps:YES] side-effect.
+                    if (nativelyWasFocused && targetFocusWindow && !targetFocusWindow.isDestroyed()) {
+                        targetFocusWindow.focus();
+                    }
+                }
+                else {
+                    console.log('[Stealth] Calling app.dock.show()');
+                    electron_1.app.dock.show();
+                    this.showTray();
+                    // Do NOT call focus() — let the user's current app retain focus
+                }
+                if (targetFocusWindow && targetFocusWindow === settingsWindow) {
+                    setTimeout(() => { this.settingsWindowHelper.setIgnoreBlur(false); }, 500);
+                }
+                if (isModelSelectorVisible) {
+                    setTimeout(() => { this.modelSelectorWindowHelper.setIgnoreBlur(false); }, 500);
+                }
+            }, 150);
+        }
+    }
+    getUndetectable() {
+        return this.isUndetectable;
+    }
+    // --- Mouse Passthrough (Adapted from public PR #113 — verify premium interaction) ---
+    overlayMousePassthrough = false;
+    setOverlayMousePassthrough(state) {
+        if (this.overlayMousePassthrough === state)
+            return;
+        console.log(`[Overlay] setOverlayMousePassthrough(${state}) called`);
+        this.overlayMousePassthrough = state;
+        this.windowHelper.syncOverlayInteractionPolicy();
+        // Immediately revalidate global shortcuts after the window interaction-policy
+        // changes.  The OS can silently drop Carbon/IOKit hotkey registrations when
+        // window focusability or visibility changes; revalidating surgically
+        // re-registers any that were lost without clobbering the others.
+        KeybindManager_1.KeybindManager.getInstance().revalidateShortcuts();
+        this._broadcastToAllWindows('overlay-mouse-passthrough-changed', state);
+    }
+    toggleOverlayMousePassthrough() {
+        const next = !this.overlayMousePassthrough;
+        this.setOverlayMousePassthrough(next);
+        return next;
+    }
+    getOverlayMousePassthrough() {
+        return this.overlayMousePassthrough;
+    }
+    getVerboseLogging() {
+        return this._verboseLogging;
+    }
+    setVerboseLogging(enabled) {
+        this._verboseLogging = enabled;
+        (0, verboseLog_1.setVerboseLoggingFlag)(enabled);
+        SettingsManager_1.SettingsManager.getInstance().set('verboseLogging', enabled);
+        console.log(`[AppState] verboseLogging set to ${enabled}`);
+        // Notify all renderer windows so they can start/stop forwarding their console output
+        this.broadcast('verbose-logging-changed', enabled);
+    }
+    setDisguise(mode) {
+        this.disguiseMode = mode;
+        SettingsManager_1.SettingsManager.getInstance().set('disguiseMode', mode);
+        // Apply the disguise regardless of undetectable state
+        // (disguise affects Activity Monitor name via process.title,
+        //  dock icon only updates when NOT in stealth)
+        this._applyDisguise(mode);
+    }
+    applyInitialDisguise() {
+        this._applyDisguise(this.disguiseMode);
+    }
+    _applyDisguise(mode) {
+        let appName = "Natively";
+        let iconPath = "";
+        const isWin = process.platform === 'win32';
+        const isMac = process.platform === 'darwin';
+        switch (mode) {
+            case 'terminal':
+                appName = isWin ? "Command Prompt " : "Terminal ";
+                if (isWin) {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/win/terminal.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/win/terminal.png");
+                }
+                else {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/mac/terminal.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/mac/terminal.png");
+                }
+                break;
+            case 'settings':
+                appName = isWin ? "Settings " : "System Settings ";
+                if (isWin) {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/win/settings.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/win/settings.png");
+                }
+                else {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/mac/settings.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/mac/settings.png");
+                }
+                break;
+            case 'activity':
+                appName = isWin ? "Task Manager " : "Activity Monitor ";
+                if (isWin) {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/win/activity.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/win/activity.png");
+                }
+                else {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/fakeicon/mac/activity.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/fakeicon/mac/activity.png");
+                }
+                break;
+            case 'none':
+                appName = "Natively";
+                if (isMac) {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "natively.icns")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/natively.icns");
+                }
+                else if (isWin) {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "assets/icons/win/icon.ico")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/icons/win/icon.ico");
+                }
+                else {
+                    iconPath = electron_1.app.isPackaged
+                        ? path_1.default.join(process.resourcesPath, "icon.png")
+                        : path_1.default.join(electron_1.app.getAppPath(), "assets/icon.png");
+                }
+                break;
+        }
+        console.log(`[AppState] Applying disguise: ${mode} (${appName}) on ${process.platform}`);
+        // 1. Update process title (affects Activity Monitor / Task Manager)
+        process.title = appName;
+        // 2. Update app name (affects macOS Menu / Dock)
+        // Skip when undetectable — app.setName() causes macOS to re-register
+        // the app and re-show the dock icon even after dock.hide()
+        if (!this.isUndetectable) {
+            electron_1.app.setName(appName);
+        }
+        if (isMac) {
+            process.env.CFBundleName = appName.trim();
+        }
+        // 3. Update App User Model ID (Windows Taskbar grouping)
+        if (isWin) {
+            // Use unique AUMID per disguise to avoid grouping with the real app
+            electron_1.app.setAppUserModelId(`com.natively.assistant.${mode}`);
+        }
+        // 4. Update Icons
+        if (fs_1.default.existsSync(iconPath)) {
+            const image = electron_1.nativeImage.createFromPath(iconPath);
+            if (isMac) {
+                // Skip dock icon update when dock is hidden to avoid potential flicker
+                if (!this.isUndetectable) {
+                    electron_1.app.dock.setIcon(image);
+                }
+            }
+            else {
+                // Windows/Linux: Update all window icons
+                this.windowHelper.getLauncherWindow()?.setIcon(image);
+                this.windowHelper.getOverlayWindow()?.setIcon(image);
+                this.settingsWindowHelper.getSettingsWindow()?.setIcon(image);
+            }
+        }
+        else {
+            console.warn(`[AppState] Disguise icon not found: ${iconPath}`);
+        }
+        // 5. Update Window Titles
+        const launcher = this.windowHelper.getLauncherWindow();
+        if (launcher && !launcher.isDestroyed()) {
+            launcher.setTitle(appName.trim());
+            launcher.webContents.send('disguise-changed', mode);
+        }
+        const overlay = this.windowHelper.getOverlayWindow();
+        if (overlay && !overlay.isDestroyed()) {
+            overlay.setTitle(appName.trim());
+            overlay.webContents.send('disguise-changed', mode);
+        }
+        const settingsWin = this.settingsWindowHelper.getSettingsWindow();
+        if (settingsWin && !settingsWin.isDestroyed()) {
+            settingsWin.setTitle(appName.trim());
+            settingsWin.webContents.send('disguise-changed', mode);
+        }
+        // Cancel any stale forceUpdate timeouts from previous disguise changes
+        for (const timer of this._disguiseTimers) {
+            clearTimeout(timer);
+        }
+        this._disguiseTimers = [];
+        // Periodically re-assert process.title only — it can drift on some systems.
+        // NOTE: We intentionally do NOT call app.setName() here — it was already called
+        // synchronously above, and repeated calls on macOS cause the system to briefly
+        // show a second dock tile while re-registering the app identity.
+        const scheduleUpdate = (ms) => {
+            const ts = setTimeout(() => {
+                process.title = appName;
+                this._disguiseTimers = this._disguiseTimers.filter(t => t !== ts);
+            }, ms);
+            this._disguiseTimers.push(ts);
+        };
+        scheduleUpdate(200);
+        scheduleUpdate(1000);
+        scheduleUpdate(5000);
+    }
+    // Helper: broadcast an IPC event to all windows
+    _broadcastToAllWindows(channel, ...args) {
+        const windows = [
+            this.windowHelper.getMainWindow(),
+            this.windowHelper.getLauncherWindow(),
+            this.windowHelper.getOverlayWindow(),
+            this.settingsWindowHelper.getSettingsWindow(),
+            this.modelSelectorWindowHelper.getWindow(),
+        ];
+        const sent = new Set();
+        for (const win of windows) {
+            if (win && !win.isDestroyed() && !sent.has(win.id)) {
+                sent.add(win.id);
+                win.webContents.send(channel, ...args);
+            }
+        }
+    }
+    getDisguise() {
+        return this.disguiseMode;
+    }
+}
+exports.AppState = AppState;
+// Application initialization
+async function initializeApp() {
+    // 1. Enforce single instance — prevent duplicate dock icons from leftover processes.
+    // In development mode with hot-reload this is still safe because electron is restarted
+    // by the build step, not re-launched by concurrently while the old process is alive.
+    const gotLock = electron_1.app.requestSingleInstanceLock();
+    if (!gotLock) {
+        console.log('[Main] Another instance is already running. Exiting this instance.');
+        // Use app.exit(0) — app.quit() before whenReady can be deferred or no-op'd
+        // (it tries to close all windows first, but none exist yet), leaving the
+        // duplicate process alive long enough to register a second tray icon on
+        // macOS Tahoe + Spotlight launches. exit() terminates immediately and
+        // cannot be intercepted by before-quit handlers.
+        electron_1.app.exit(0);
+        return;
+    }
+    // When a duplicate launch is attempted (e.g. user invokes Spotlight again
+    // while Natively is running), focus and recenter the existing window so the
+    // launch is visibly handled instead of silently absorbed.
+    electron_1.app.on('second-instance', () => {
+        try {
+            const appState = AppState.getInstance();
+            appState.centerAndShowWindow();
+        }
+        catch (err) {
+            console.error('[Main] second-instance handler failed:', err);
+        }
+    });
+    // 2. Wait for app to be ready
+    await electron_1.app.whenReady();
+    // 2a. PRE-EMPTIVE dock hide: must happen before ANY operation that causes macOS to
+    // register a dock entry (app.setName, BrowserWindow creation, etc.).
+    // We read isUndetectable directly from settings here — AppState singleton isn't
+    // constructed yet, so we cannot call appState.getUndetectable().
+    if (process.platform === 'darwin') {
+        // SettingsManager is already statically imported — no require() needed.
+        const isUndetectableOnStartup = SettingsManager_1.SettingsManager.getInstance().get('isUndetectable') ?? false;
+        if (isUndetectableOnStartup) {
+            electron_1.app.dock.hide();
+        }
+    }
+    // 3. Initialize Managers
+    // Phase 6 — bind TelemetryService to the Electron userData path. The
+    // singleton was constructed with cwd-relative paths at module-load time
+    // (before app.whenReady), so we reconfigure here. Honors the user's
+    // telemetry-enabled setting (default: on, local-only JSONL).
+    try {
+        const { telemetryService } = require('./services/telemetry/TelemetryService');
+        const userDataPath = electron_1.app.getPath('userData');
+        const telemetryEnabledSetting = SettingsManager_1.SettingsManager.getInstance().get('telemetryEnabled');
+        telemetryService.configure({
+            userDataPath,
+            enabled: telemetryEnabledSetting !== false, // default true
+            localEnabled: true,
+        });
+        telemetryService.track({ name: 'app_start', properties: { platform: process.platform } });
+    }
+    catch (err) {
+        console.warn('[Init] TelemetryService configure threw (non-fatal):', err);
+    }
+    // Initialize CredentialsManager and load keys explicitly
+    // This fixes the issue where keys (especially in production) aren't loaded in time for RAG/LLM
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    CredentialsManager.getInstance().init();
+    // 4. Initialize State
+    const appState = AppState.getInstance();
+    // Explicitly load credentials into helpers
+    appState.processingHelper.loadStoredCredentials();
+    // Seed the un-deletable General mode once at startup. Idempotent.
+    try {
+        const { ModesManager } = require('./services/ModesManager');
+        ModesManager.getInstance().ensureSeeded();
+    }
+    catch (err) {
+        console.warn('[Init] ModesManager.ensureSeeded threw (non-fatal):', err);
+    }
+    // Initialize IPC handlers before window creation
+    (0, ipcHandlers_1.initializeIpcHandlers)(appState);
+    // Apply the full disguise payload (names, dock icon, AUMID) early
+    appState.applyInitialDisguise();
+    // Start the Ollama lifecycle manager
+    OllamaManager_1.OllamaManager.getInstance().init().catch(console.error);
+    // NOTE: CredentialsManager.init() and loadStoredCredentials() are already called
+    // above before this block — do NOT call them again here to avoid double key-load.
+    // Anonymous install ping - one-time, non-blocking
+    // See electron/services/InstallPingManager.ts for privacy details
+    const { sendAnonymousInstallPing } = require('./services/InstallPingManager');
+    sendAnonymousInstallPing();
+    // Load stored Google Service Account path (for Speech-to-Text)
+    // Fall back to GOOGLE_APPLICATION_CREDENTIALS env var (set in terminal but not Spotlight)
+    const storedServiceAccountPath = CredentialsManager.getInstance().getGoogleServiceAccountPath()
+        || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (storedServiceAccountPath) {
+        console.log("[Init] Loading stored Google Service Account path");
+        appState.updateGoogleCredentials(storedServiceAccountPath);
+        // Persist env-var path so Spotlight launches also work going forward
+        if (!CredentialsManager.getInstance().getGoogleServiceAccountPath()) {
+            CredentialsManager.getInstance().setGoogleServiceAccountPath(storedServiceAccountPath);
+        }
+    }
+    console.log("App is ready");
+    // PERF: pre-construct STT provider objects so the meeting-start critical
+    // path doesn't pay for class init + listener wiring. Runs after all
+    // credentials are loaded (so the provider can read its API key) and is
+    // non-blocking — failures are logged and retried at meeting start.
+    try {
+        appState.prewarmSttProviders();
+    }
+    catch (err) {
+        console.warn('[Init] STT pre-warm threw (non-fatal):', err);
+    }
+    appState.createWindow();
+    // Apply initial stealth state based on isUndetectable setting.
+    // NOTE: app.dock.hide() was already called pre-emptively before createWindow()
+    // when isUndetectable=true. Here we only need to initialize the tray for non-stealth mode.
+    if (!appState.getUndetectable()) {
+        // Normal mode: show tray (dock is already showing — no need to call dock.show() again)
+        appState.showTray();
+    }
+    // Stealth mode: dock is already hidden, tray stays hidden, no action needed here.
+    // Register global shortcuts using KeybindManager
+    KeybindManager_1.KeybindManager.getInstance().registerGlobalShortcuts();
+    // System sleep/wake handling. macOS invalidates CoreAudio AggregateDevice
+    // handles on sleep — without this the Process Tap silently stops delivering
+    // buffers on resume and the user sits in front of a frozen transcript with
+    // no idea why. Fire restartCapturesAfterResume on resume; it's a no-op if
+    // no meeting is active. The 'lock-screen' event isn't useful here (the OS
+    // doesn't tear down audio on lock) so we don't subscribe to it.
+    try {
+        const { powerMonitor } = require('electron');
+        powerMonitor.on('resume', () => {
+            console.log('[Main] powerMonitor: system resumed from sleep.');
+            appState.restartCapturesAfterResume().catch((err) => console.error('[Main] restartCapturesAfterResume threw:', err));
+        });
+        powerMonitor.on('suspend', () => {
+            console.log('[Main] powerMonitor: system suspending. Captures will be recreated on resume if a meeting is active.');
+        });
+    }
+    catch (err) {
+        console.warn('[Main] powerMonitor unavailable — sleep/wake recovery disabled:', err);
+    }
+    // Pre-create settings window in background for faster first open
+    appState.settingsWindowHelper.preloadWindow();
+    // Restore Phone Mirror service if it was enabled in a previous session.
+    // Failure here is non-fatal — the user can re-enable from Settings.
+    if (SettingsManager_1.SettingsManager.getInstance().get('phoneMirrorEnabled')) {
+        PhoneMirrorService_1.PhoneMirrorService.getInstance()
+            .start({ exposeOnLan: !!SettingsManager_1.SettingsManager.getInstance().get('phoneMirrorExposeOnLan'), persist: false })
+            .catch((err) => console.error('[Init] PhoneMirror auto-start failed:', err));
+    }
+    // One-time macOS screen recording permission prompt.
+    //
+    // We must fire this AFTER createWindow() so that:
+    //   1. The Natively launcher window is visible and focused when the TCC dialog
+    //      appears — macOS anchors the dialog to the frontmost app window on Ventura+.
+    //      Without a visible window the dialog can appear behind other apps (Sequoia).
+    //   2. In stealth/undetectable mode the dock icon is hidden, but the window is
+    //      still visible — the dialog still has a surface to attach to.
+    //
+    // The 800ms delay lets the launcher's ready-to-show animation complete so the
+    // window is fully composited before the system sheet appears above it.
+    //
+    // TCC caches the decision permanently after the first response — this block
+    // runs exactly ONCE on the first launch of each unique packaged binary.
+    // On every subsequent launch the status is 'granted' or 'denied', and we skip.
+    if (process.platform === 'darwin') {
+        setTimeout(async () => {
+            try {
+                const screenStatus = electron_1.systemPreferences.getMediaAccessStatus('screen');
+                console.log(`[Init] Screen recording permission status at startup: ${screenStatus}`);
+                if (!electron_1.app.isPackaged) {
+                    console.log('[Init] Ignoring screen recording permission check in development mode');
+                    return;
+                }
+                if (screenStatus === 'not-determined') {
+                    // First launch: trigger the one-time TCC dialog by making a minimal
+                    // desktopCapturer call. macOS will show the permission sheet anchored
+                    // to our window. The user's response is stored permanently in the TCC
+                    // database — we do NOT check status immediately after because the dialog
+                    // is still open; the status will be read correctly next time `startMeeting`
+                    // is called (which is the correct gate for system audio access).
+                    console.log('[Init] Screen recording not-determined — showing one-time TCC dialog...');
+                    try {
+                        await electron_1.desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+                    }
+                    catch (e) {
+                        // On some Electron builds getSources throws when permission is pending —
+                        // that's fine; the TCC dialog has still been triggered.
+                        console.log('[Init] getSources threw (expected during TCC pending state):', e.message);
+                    }
+                    // NOTE: Do NOT read afterStatus here — TCC response is async (dialog still open).
+                    // startMeeting() reads the status when the user actually tries to use audio.
+                }
+                else if (screenStatus === 'denied') {
+                    // Returning user who previously denied — show the banner immediately at startup
+                    // so they know system audio won't work before they even start a meeting.
+                    console.warn('[Init] Screen recording was previously denied — notifying UI banner.');
+                    const { BrowserWindow } = require('electron');
+                    BrowserWindow.getAllWindows().forEach((win) => {
+                        if (!win.isDestroyed()) {
+                            win.webContents.send('system-audio-permission-denied', 'Screen Recording is disabled. System audio capture will not work. Click "Open Settings" to enable it, then restart Natively.');
+                        }
+                    });
+                }
+                else {
+                    // 'granted' or 'restricted' — nothing to do.
+                    console.log(`[Init] Screen recording permission already resolved: ${screenStatus}`);
+                }
+            }
+            catch (e) {
+                console.warn('[Init] Startup screen recording permission check failed:', e);
+            }
+        }, 800);
+    }
+    // Initialize CalendarManager
+    try {
+        const { CalendarManager } = require('./services/CalendarManager');
+        const calMgr = CalendarManager.getInstance();
+        calMgr.init();
+        calMgr.on('start-meeting-requested', (event) => {
+            console.log('[Main] Start meeting requested from calendar notification', event);
+            appState.centerAndShowWindow();
+            appState.startMeeting({
+                title: event.title,
+                calendarEventId: event.id,
+                source: 'calendar'
+            });
+        });
+        calMgr.on('open-requested', () => {
+            appState.centerAndShowWindow();
+        });
+        console.log('[Main] CalendarManager initialized');
+    }
+    catch (e) {
+        console.error('[Main] Failed to initialize CalendarManager:', e);
+    }
+    // Recover unprocessed meetings (persistence check)
+    appState.getIntelligenceManager().recoverUnprocessedMeetings().catch(err => {
+        console.error('[Main] Failed to recover unprocessed meetings:', err);
+    });
+    // Note: We do NOT force dock show here anymore, respecting stealth mode.
+    electron_1.app.on("activate", () => {
+        console.log("App activated");
+        if (process.platform === 'darwin') {
+            // Do NOT call dock.show() while a meeting is running — the dock icon
+            // appearing mid-meeting is a critical stealth failure.
+            if (!appState.getUndetectable() && !appState.getIsMeetingActive()) {
+                electron_1.app.dock.show();
+            }
+        }
+        // If no window exists, create it
+        if (appState.getMainWindow() === null) {
+            appState.createWindow();
+        }
+        else {
+            // If the window exists but is hidden, clicking the dock icon should restore it
+            if (!appState.isVisible()) {
+                appState.toggleMainWindow();
+            }
+        }
+    });
+    // Quit when all windows are closed, except on macOS
+    electron_1.app.on("window-all-closed", () => {
+        if (process.platform !== "darwin") {
+            electron_1.app.quit();
+        }
+    });
+    // Scrub API keys from memory on quit to minimize exposure window
+    electron_1.app.on("before-quit", (event) => {
+        console.log("App is quitting, cleaning up resources...");
+        appState.setQuitting(true);
+        // ROUND 2 FIX (#9): synchronously stop the CGEventTap worker thread
+        // BEFORE V8 starts tearing down. The tap callback holds an
+        // Arc<ThreadsafeFunction> that calls into napi from a non-V8 thread;
+        // if V8 is mid-teardown when the callback runs, napi's release path
+        // crashes. stop() joins the worker, guaranteeing no in-flight callbacks
+        // remain by the time we return.
+        //
+        // ORDERING NOTE: this MUST happen before any subsequent napi-touching
+        // cleanup (cropper.dispose, ollama.stop, phoneMirror.dispose). Those
+        // can spawn their own native threads or release napi resources, which
+        // would race with our worker if it's still alive.
+        if (process.platform === 'darwin') {
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+                StealthKeyboardManager.getInstance().stop();
+            }
+            catch (e) {
+                console.error('[main] Failed to stop StealthKeyboardManager during shutdown:', e);
+            }
+        }
+        // Dispose CropperWindowHelper to clean up IPC listeners and prevent memory leaks
+        // This is critical to prevent resource leaks and ensure proper cleanup
+        if (appState?.cropperWindowHelper) {
+            appState.cropperWindowHelper.dispose();
+        }
+        // Kill Ollama if we started it
+        OllamaManager_1.OllamaManager.getInstance().stop();
+        // Tear down the Phone Mirror service so the OS port is freed cleanly.
+        PhoneMirrorService_1.PhoneMirrorService.getInstance().dispose().catch((err) => console.error('[Main] PhoneMirror dispose failed:', err));
+        try {
+            const { CredentialsManager } = require('./services/CredentialsManager');
+            CredentialsManager.getInstance().scrubMemory();
+            appState.processingHelper.getLLMHelper().scrubKeys();
+            console.log('[Main] Credentials scrubbed from memory on quit');
+        }
+        catch (e) {
+            console.error('[Main] Failed to scrub credentials on quit:', e);
+        }
+        // Clean up screenshot queues to prevent residual PNG files on disk
+        try {
+            const { ScreenshotHelper } = require('./ScreenshotHelper');
+            // Clear screenshot queues - this deletes all queued screenshot files
+            const screenshotHelper = new ScreenshotHelper();
+            screenshotHelper.clearQueues();
+            console.log('[Main] Screenshot queues cleared on quit');
+        }
+        catch (e) {
+            console.error('[Main] Failed to clear screenshot queues on quit:', e);
+        }
+    });
+    // app.dock?.hide() // REMOVED: User wants Dock icon visible
+    electron_1.app.commandLine.appendSwitch("disable-background-timer-throttling");
+}
+// Start the application
+initializeApp().catch(console.error);
+//# sourceMappingURL=main.js.map
