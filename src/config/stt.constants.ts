@@ -50,7 +50,6 @@ export const STT_PROVIDERS: Record<SttProviderId, SttProviderConfig> = {
         extraFormFields: {
             temperature: '0',
             response_format: 'json',
-            language: 'en',
         },
     },
     openai: {
@@ -128,4 +127,3 @@ export const STT_PROVIDERS: Record<SttProviderId, SttProviderConfig> = {
 export const STT_PROVIDER_OPTIONS = Object.values(STT_PROVIDERS);
 
 export const DEFAULT_STT_PROVIDER: SttProviderId = 'google';
-

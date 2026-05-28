@@ -32,6 +32,7 @@ type ProviderConfigFactory = (apiKey: string, region?: string, languageKey?: str
 
 const PROVIDER_CONFIGS: Record<RestSttProvider, ProviderConfigFactory> = {
     groq: (apiKey, region, languageKey) => {
+        const isAuto = !languageKey || languageKey === 'auto';
         const lang = (languageKey && languageKey !== 'auto') ? RECOGNITION_LANGUAGES[languageKey]?.iso639 : undefined;
         return {
             endpoint: 'https://api.groq.com/openai/v1/audio/transcriptions',
@@ -41,6 +42,7 @@ const PROVIDER_CONFIGS: Record<RestSttProvider, ProviderConfigFactory> = {
             extraFormFields: {
                 temperature: '0',
                 response_format: 'json',
+                ...(isAuto ? { prompt: 'Prefer Polish transcription when audio is Polish; do not reinterpret Polish speech as Ukrainian.' } : {}),
                 ...(lang ? { language: lang } : {})
             },
             extractTranscript: (data: any) => {

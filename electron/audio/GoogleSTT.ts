@@ -103,10 +103,10 @@ export class GoogleSTT extends EventEmitter {
         this.pendingLanguageChange = setTimeout(() => {
             if (key === 'auto') {
                 // Google STT v1 supports up to 3 alternativeLanguageCodes.
-                // Use en-US as primary with the most common languages as alternates.
+                // Use en-US as primary with common alternates and Polish support.
                 this.languageCode = 'en-US';
-                this.alternativeLanguageCodes = ['fr-FR', 'es-ES', 'de-DE'];
-                console.log(`[GoogleSTT/${this.label}] Language set to auto-detect (en-US + fr/es/de alternates)`);
+                this.alternativeLanguageCodes = ['fr-FR', 'es-ES', 'pl-PL'];
+                console.log(`[GoogleSTT/${this.label}] Language set to auto-detect (en-US + fr/es/pl alternates)`);
             } else {
                 const config = RECOGNITION_LANGUAGES[key];
                 if (!config) {

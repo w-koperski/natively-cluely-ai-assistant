@@ -144,7 +144,7 @@ export class DeepgramStreamingSTT extends EventEmitter {
 
             const deepgram = createClient(this.apiKey);
 
-            this.live = deepgram.listen.live({
+            const liveOptions: Record<string, any> = {
                 model: 'nova-3',
                 language: this.languageCode,
                 smart_format: true,
@@ -155,7 +155,14 @@ export class DeepgramStreamingSTT extends EventEmitter {
                 endpointing: 300,
                 utterance_end_ms: 1000,
                 vad_events: true,
-            });
+            };
+
+            if (this.languageCode === 'multi') {
+                // In auto mode, constrain language detection to reduce PL↔UK confusion.
+                liveOptions.detect_language = ['pl', 'en', 'uk'];
+            }
+
+            this.live = deepgram.listen.live(liveOptions);
 
             this.live.on(LiveTranscriptionEvents.Open, () => {
                 this.isConnecting = false;
